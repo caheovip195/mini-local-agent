@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -66,7 +66,11 @@
         },
         "localAgent.provider.preset": {
           "type": "string",
-          "enum": ["lmstudio", "openrouter", "custom"],
+          "enum": [
+            "lmstudio",
+            "openrouter",
+            "custom"
+          ],
           "default": "lmstudio",
           "description": "Backend provider preset. 'custom' works with any OpenAI-compatible API."
         },

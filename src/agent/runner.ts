@@ -29,11 +29,24 @@ const WORKSPACE_INDEX_LIMIT = 4000;
 const SNAPSHOT_HEAD_PREVIEW = 220;
 const SNAPSHOT_TAIL_PREVIEW = 80;
 const DUPLICATE_GUARD_LIMIT = 5;
+const BROAD_SCOPE_STEP_LIMIT = 10;
 
 interface ActionExecutionResult {
   kind: "tool" | "complete" | "final";
   message: string;
   progress: boolean;
+}
+
+type ScopeClass = "micro" | "small" | "medium" | "broad";
+
+interface TaskScopeProfile {
+  rawTask: string;
+  scopeClass: ScopeClass;
+  isTestTask: boolean;
+  allowRewrite: boolean;
+  maxChangedFiles: number;
+  focusTerms: string[];
+  contract: string[];
 }
 
 interface WorkspaceSnapshotOptions {
@@ -62,6 +75,7 @@ export class LocalAgentRunner {
   private workspaceFileIndexCache?: string[];
   private selectedStrategyBrief = "Use minimal-change implementation aligned with existing project structure.";
   private verificationAttempted = false;
+  private currentTaskScope?: TaskScopeProfile;
 
   constructor(
     private readonly client: LmStudioClient,
@@ -70,10 +84,16 @@ export class LocalAgentRunner {
   ) {}
 
   async createPlan(task: string, signal?: AbortSignal): Promise<ExecutionPlan> {
+    const scopeProfile = this.buildTaskScope(task);
+    this.currentTaskScope = scopeProfile;
+    this.callbacks.onLog(
+      `Task scope: class=${scopeProfile.scopeClass}, testTask=${scopeProfile.isTestTask}, allowRewrite=${scopeProfile.allowRewrite}, maxChangedFiles=${scopeProfile.maxChangedFiles}, focus=${scopeProfile.focusTerms.join(", ") || "(none)"}`
+    );
+
     this.callbacks.onStatus("Analyzing workspace for planning...");
     const workspaceContext = await this.getPlannerWorkspaceSnapshot();
     this.callbacks.onStatus("Comparing implementation approaches...");
-    this.selectedStrategyBrief = await this.buildImplementationStrategy(task, workspaceContext, signal);
+    this.selectedStrategyBrief = await this.buildImplementationStrategy(task, workspaceContext, scopeProfile, signal);
     this.callbacks.onLog(`Selected strategy:\n${this.selectedStrategyBrief}`);
 
     const messages: ChatMessage[] = [
@@ -85,6 +105,9 @@ export class LocalAgentRunner {
         role: "user",
         content: [
           `User task:\n${task}`,
+          "",
+          "Task scope contract:",
+          ...scopeProfile.contract,
           "",
           "Selected implementation strategy:",
           this.selectedStrategyBrief,
@@ -110,7 +133,7 @@ export class LocalAgentRunner {
     }
     this.callbacks.onLog(`Planner raw output:\n${rawPlan}`);
 
-    const plan = this.parsePlan(rawPlan, task);
+    const plan = this.parsePlan(rawPlan, task, scopeProfile);
     this.callbacks.onPlan(plan);
     return plan;
   }
@@ -191,6 +214,8 @@ export class LocalAgentRunner {
           `Step details: ${step.details}`,
           `Workspace root: ${this.config.workspaceRoot}`,
           `Selected strategy:\n${this.selectedStrategyBrief}`,
+          "Task scope contract:",
+          ...(this.currentTaskScope?.contract ?? []),
           "You have full read access to all files under workspace root.",
           "Never ask the user where files/screens/components are located; discover by list/search/read actions.",
           `Minimum investigation actions required before write/run/complete: ${minInvestigations}`,
@@ -582,6 +607,14 @@ export class LocalAgentRunner {
           const absPath = this.resolveWorkspacePath(filePath);
           const relPath = this.toRelative(absPath);
           const existsBeforeWrite = await this.fileExists(absPath);
+          const writeScopeBlock = this.evaluateWriteScopeGuard(relPath, existsBeforeWrite);
+          if (writeScopeBlock) {
+            return {
+              kind: "tool",
+              message: writeScopeBlock,
+              progress: false
+            };
+          }
 
           if (!existsBeforeWrite) {
             const duplicateCandidates = await this.findLikelyDuplicateFiles(relPath);
@@ -627,6 +660,11 @@ export class LocalAgentRunner {
         const command = toStringValue(action.command);
         if (!command) {
           return { kind: "tool", message: "run_command failed: missing command.", progress: false };
+        }
+
+        const commandScopeBlock = this.evaluateCommandScopeGuard(command);
+        if (commandScopeBlock) {
+          return { kind: "tool", message: commandScopeBlock, progress: false };
         }
 
         if (this.isDangerousCommand(command)) {
@@ -868,6 +906,7 @@ export class LocalAgentRunner {
   private async buildImplementationStrategy(
     task: string,
     workspaceContext: string,
+    scopeProfile: TaskScopeProfile,
     signal?: AbortSignal
   ): Promise<string> {
     const candidateCount = Math.min(Math.max(this.config.strategyCandidates, 2), 5);
@@ -902,6 +941,7 @@ export class LocalAgentRunner {
             "- Evaluate against existing structure, naming, and dependencies in workspace context.",
             "- Prefer minimal invasive change and reuse existing modules/tests.",
             "- Do not ask user for file paths.",
+            "- Strictly respect task scope; do not expand a narrow test/bugfix request into project rewrite.",
             "- Keep concise and actionable."
           ].join("\n")
         },
@@ -909,6 +949,9 @@ export class LocalAgentRunner {
           role: "user",
           content: [
             `Task:\n${task}`,
+            "",
+            "Task scope contract:",
+            ...scopeProfile.contract,
             "",
             "Workspace context:",
             workspaceContext,
@@ -1442,7 +1485,421 @@ export class LocalAgentRunner {
     return undefined;
   }
 
-  private parsePlan(raw: string, task: string): ExecutionPlan {
+  private buildTaskScope(task: string): TaskScopeProfile {
+    const primaryTask = this.extractPrimaryTaskText(task);
+    const lower = primaryTask.toLowerCase();
+    const isTestTask =
+      /\bintegration\s+test\b/.test(lower) ||
+      /\bunit\s+test\b/.test(lower) ||
+      /\bwidget\s+test\b/.test(lower) ||
+      /\be2e\b/.test(lower) ||
+      /\btest\b/.test(lower) ||
+      /\bspec\b/.test(lower);
+    const allowRewrite =
+      this.containsBroadRewriteLanguage(primaryTask) ||
+      /\bfrom\s+scratch\b/.test(lower) ||
+      /\bnew\s+architecture\b/.test(lower);
+    const focusTerms = this.extractTaskFocusTerms(primaryTask, 8);
+    const scopeClass = this.classifyScope(primaryTask, isTestTask, allowRewrite, focusTerms.length);
+    const maxChangedFilesByScope: Record<ScopeClass, number> = {
+      micro: 4,
+      small: 7,
+      medium: 14,
+      broad: 200
+    };
+
+    let maxChangedFiles = maxChangedFilesByScope[scopeClass];
+    if (isTestTask && scopeClass !== "broad") {
+      maxChangedFiles = Math.min(maxChangedFiles, scopeClass === "micro" ? 4 : 6);
+    }
+
+    const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "explicit modules from the request";
+    const contract = [
+      `- Scope class: ${scopeClass}.`,
+      `- Maximum changed files target: ${maxChangedFiles}.`,
+      allowRewrite
+        ? "- Broad refactor is explicitly allowed only if required by the request."
+        : "- Do NOT rewrite architecture or refactor unrelated modules.",
+      isTestTask
+        ? "- Primary deliverable is test code. Prefer test directories and *test/*spec files."
+        : "- Prefer minimal edits in existing files closest to the requested behavior.",
+      `- Keep edits focused on: ${focusLabel}.`,
+      "- If a proposed step is broad, shrink it to the smallest valid implementation."
+    ];
+
+    return {
+      rawTask: primaryTask,
+      scopeClass,
+      isTestTask,
+      allowRewrite,
+      maxChangedFiles,
+      focusTerms,
+      contract
+    };
+  }
+
+  private extractPrimaryTaskText(task: string): string {
+    const originalRequestMatch = task.match(/Original user request:\s*\n([\s\S]*)$/i);
+    if (originalRequestMatch && originalRequestMatch[1].trim().length > 0) {
+      return originalRequestMatch[1].trim();
+    }
+
+    const currentRequestMatch = task.match(
+      /Current request:\s*\n([\s\S]*?)(?:\n\nExecution brief:|\n\nProject learning rules:|\n\nUnfinished run context:|\n\nOriginal user request:|$)/i
+    );
+    if (currentRequestMatch && currentRequestMatch[1].trim().length > 0) {
+      return currentRequestMatch[1].trim();
+    }
+
+    return task.trim();
+  }
+
+  private classifyScope(
+    task: string,
+    isTestTask: boolean,
+    allowRewrite: boolean,
+    focusTermCount: number
+  ): ScopeClass {
+    const lower = task.toLowerCase();
+    if (allowRewrite) {
+      return "broad";
+    }
+
+    const broadSignals = [
+      "entire project",
+      "whole project",
+      "rewrite all",
+      "project-wide",
+      "across all modules",
+      "overhaul",
+      "viet lai ca project"
+    ];
+    if (broadSignals.some((signal) => lower.includes(signal))) {
+      return "broad";
+    }
+
+    if (/\brefactor\b/.test(lower) || /\bmigrate\b/.test(lower) || /\boptimiz/.test(lower)) {
+      return "medium";
+    }
+
+    if (isTestTask) {
+      return focusTermCount <= 1 ? "micro" : "small";
+    }
+
+    if (focusTermCount <= 1 && /\b(fix|bug|write|add|update|implement)\b/.test(lower)) {
+      return "micro";
+    }
+
+    return "small";
+  }
+
+  private extractTaskFocusTerms(task: string, limit: number): string[] {
+    const quoted = [...task.matchAll(/["'`]([^"'`]{2,})["'`]/g)].map((match) => match[1]);
+    const rawTokens = task.split(/[^A-Za-z0-9_./-]+/g);
+    const stopWords = new Set([
+      "task",
+      "write",
+      "create",
+      "update",
+      "implement",
+      "integration",
+      "unit",
+      "widget",
+      "test",
+      "tests",
+      "spec",
+      "screen",
+      "page",
+      "controller",
+      "feature",
+      "module",
+      "project",
+      "request",
+      "continue",
+      "resume",
+      "tiep",
+      "tuc",
+      "lam",
+      "cho",
+      "va",
+      "cac",
+      "nhung"
+    ]);
+
+    const frequency = new Map<string, number>();
+    for (const source of [...quoted, ...rawTokens]) {
+      const parts = source.split(/[\/._-]+/g);
+      for (const part of parts) {
+        const token = part.trim().toLowerCase();
+        if (token.length < 3 || stopWords.has(token) || /^\d+$/.test(token)) {
+          continue;
+        }
+        frequency.set(token, (frequency.get(token) ?? 0) + 1);
+      }
+    }
+
+    return Array.from(frequency.entries())
+      .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || a[0].localeCompare(b[0]))
+      .slice(0, Math.max(1, limit))
+      .map(([token]) => token);
+  }
+
+  private containsBroadRewriteLanguage(text: string): boolean {
+    const lower = text.toLowerCase();
+    const patterns = [
+      /\brewrite\b/,
+      /\bre-?architect/,
+      /\boverhaul\b/,
+      /\bfrom\s+scratch\b/,
+      /\bfull\s+refactor\b/,
+      /\bproject-wide\s+refactor\b/,
+      /\brebuild\b/,
+      /\bredesign\s+architecture\b/,
+      /\breplace\s+the\s+whole\b/,
+      /\bviet\s+lai\b/
+    ];
+    return patterns.some((pattern) => pattern.test(lower));
+  }
+
+  private enforcePlanScope(plan: ExecutionPlan, task: string, scope: TaskScopeProfile): ExecutionPlan {
+    if (scope.scopeClass === "broad" || scope.allowRewrite) {
+      return plan;
+    }
+
+    const stepLimit = scope.scopeClass === "micro" ? 6 : BROAD_SCOPE_STEP_LIMIT;
+    const broadSteps = plan.steps.filter((step) =>
+      this.containsBroadRewriteLanguage(`${step.title} ${step.details}`)
+    );
+    const tooManySteps = plan.steps.length > stepLimit;
+    const suspiciousTestSteps =
+      scope.isTestTask
+        ? plan.steps.filter((step) => {
+            const text = `${step.title} ${step.details}`.toLowerCase();
+            if (/\btest\b|\bspec\b/.test(text)) {
+              return false;
+            }
+            return (
+              /\brefactor\b/.test(text) ||
+              /\bmigrate\b/.test(text) ||
+              /\bscaffold\b/.test(text) ||
+              /\brewrite\b/.test(text) ||
+              /\barchitecture\b/.test(text)
+            );
+          })
+        : [];
+    const focusCoverage =
+      scope.focusTerms.length > 0
+        ? plan.steps.filter((step) => this.pathMatchesFocusTerms(`${step.title} ${step.details}`, scope.focusTerms))
+            .length
+        : plan.steps.length;
+    const lowFocusCoverage = scope.focusTerms.length > 0 && focusCoverage === 0 && plan.steps.length >= 2;
+
+    if (!tooManySteps && broadSteps.length === 0 && suspiciousTestSteps.length === 0 && !lowFocusCoverage) {
+      return plan;
+    }
+
+    const reasons: string[] = [];
+    if (tooManySteps) {
+      reasons.push(`step count ${plan.steps.length} exceeds scope limit ${stepLimit}`);
+    }
+    if (broadSteps.length > 0) {
+      reasons.push(`broad rewrite wording in steps: ${broadSteps.map((step) => step.id).join(", ")}`);
+    }
+    if (suspiciousTestSteps.length > 0) {
+      reasons.push(
+        `test task drift detected in steps: ${suspiciousTestSteps.map((step) => step.id).join(", ")}`
+      );
+    }
+    if (lowFocusCoverage) {
+      reasons.push("none of the steps mention request focus terms");
+    }
+
+    const reasonText = reasons.join("; ");
+    this.callbacks.onLog(`PlanScopeGuard: replacing planner output with scoped fallback (${reasonText}).`);
+    return this.buildScopedFallbackPlan(task, scope, reasonText);
+  }
+
+  private buildScopedFallbackPlan(task: string, scope: TaskScopeProfile, reason: string): ExecutionPlan {
+    const focusLabel = scope.focusTerms.length > 0 ? scope.focusTerms.join(", ") : "requested module/feature";
+    const assumptions = [
+      reason,
+      "Apply minimal-change implementation and keep project structure intact."
+    ].filter((item) => item.trim().length > 0);
+
+    if (scope.isTestTask) {
+      return {
+        summary: "Scoped fallback plan for focused test implementation.",
+        assumptions,
+        steps: [
+          {
+            id: "S1",
+            title: "Locate target module and existing test style",
+            details: `Find files related to ${focusLabel} and inspect current testing patterns.`,
+            status: "pending"
+          },
+          {
+            id: "S2",
+            title: "Create or update focused integration test",
+            details:
+              "Add test cases only for the requested scope, reusing existing naming and folder conventions.",
+            status: "pending"
+          },
+          {
+            id: "S3",
+            title: "Cover realistic scenarios and edge cases",
+            details: "Implement assertions for expected behavior and key failure/empty states.",
+            status: "pending"
+          },
+          {
+            id: "S4",
+            title: "Run targeted verification",
+            details: "Execute the most relevant test command and summarize changed files.",
+            status: "pending"
+          }
+        ]
+      };
+    }
+
+    return {
+      summary: "Scoped fallback plan for minimal implementation.",
+      assumptions,
+      steps: [
+        {
+          id: "S1",
+          title: "Locate exact affected files",
+          details: `Discover files tied to ${focusLabel} and avoid unrelated modules.`,
+          status: "pending"
+        },
+        {
+          id: "S2",
+          title: "Implement minimal code changes",
+          details: "Edit only relevant files while preserving existing architecture and style.",
+          status: "pending"
+        },
+        {
+          id: "S3",
+          title: "Run focused verification and summarize",
+          details: "Run targeted tests/lint/typecheck and report what changed.",
+          status: "pending"
+        }
+      ]
+    };
+  }
+
+  private evaluateWriteScopeGuard(relPath: string, existsBeforeWrite: boolean): string | undefined {
+    const scope = this.currentTaskScope;
+    if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
+      return undefined;
+    }
+
+    if (this.changedFiles.size >= scope.maxChangedFiles && !this.changedFiles.has(relPath)) {
+      return `ScopeGuard: write blocked because changed file limit (${scope.maxChangedFiles}) is reached for this task scope.`;
+    }
+
+    const lowerPath = relPath.toLowerCase();
+    const touchesFocus = this.pathMatchesFocusTerms(relPath, scope.focusTerms);
+    const testFile = this.isLikelyTestFile(lowerPath);
+    const globalFile = this.isGlobalProjectFile(lowerPath);
+
+    if (scope.isTestTask && !testFile && !touchesFocus) {
+      return [
+        `ScopeGuard: '${relPath}' is outside test-focused scope.`,
+        "For test tasks, edit test files or files directly tied to target module terms."
+      ].join(" ");
+    }
+
+    if ((scope.scopeClass === "micro" || scope.scopeClass === "small") && globalFile && !touchesFocus) {
+      return [
+        `ScopeGuard: '${relPath}' looks project-wide and is off-scope for a narrow request.`,
+        "Keep edits near the requested module unless user explicitly asks for global changes."
+      ].join(" ");
+    }
+
+    if (!existsBeforeWrite && scope.scopeClass === "micro" && !testFile && !touchesFocus) {
+      return [
+        `ScopeGuard: creating new file '${relPath}' is likely off-scope for this micro task.`,
+        "Reuse existing files or target-focused test files."
+      ].join(" ");
+    }
+
+    return undefined;
+  }
+
+  private evaluateCommandScopeGuard(command: string): string | undefined {
+    const scope = this.currentTaskScope;
+    if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
+      return undefined;
+    }
+
+    const lower = command.toLowerCase();
+    const scaffoldPatterns = [
+      /\bnpm\s+init\b/,
+      /\bnpx\s+create\b/,
+      /\bpnpm\s+create\b/,
+      /\byarn\s+create\b/,
+      /\bflutter\s+create\b/,
+      /\brails\s+new\b/,
+      /\bcargo\s+new\b/,
+      /\bgo\s+mod\s+init\b/,
+      /\bgit\s+init\b/
+    ];
+
+    if (scaffoldPatterns.some((pattern) => pattern.test(lower))) {
+      return "ScopeGuard: scaffold/init command blocked for narrow task scope.";
+    }
+
+    if ((scope.scopeClass === "micro" || scope.scopeClass === "small") && /\bcodemod\b|\bmigrate\b/.test(lower)) {
+      return "ScopeGuard: broad migration command blocked for narrow task scope.";
+    }
+
+    return undefined;
+  }
+
+  private pathMatchesFocusTerms(textOrPath: string, focusTerms: string[]): boolean {
+    if (focusTerms.length === 0) {
+      return false;
+    }
+    const lower = textOrPath.toLowerCase();
+    return focusTerms.some((term) => term.length >= 3 && lower.includes(term.toLowerCase()));
+  }
+
+  private isLikelyTestFile(relativePathLower: string): boolean {
+    return (
+      /(^|\/)(test|tests|__tests__|integration_test|e2e)\//.test(relativePathLower) ||
+      /\.(test|spec)\.[a-z0-9]+$/.test(relativePathLower) ||
+      /_test\.[a-z0-9]+$/.test(relativePathLower)
+    );
+  }
+
+  private isGlobalProjectFile(relativePathLower: string): boolean {
+    const fileName = path.posix.basename(relativePathLower);
+    const globalNames = new Set([
+      "package.json",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "pubspec.yaml",
+      "pubspec.lock",
+      "tsconfig.json",
+      "tsconfig.base.json",
+      "analysis_options.yaml",
+      "readme.md",
+      "dockerfile",
+      "docker-compose.yml",
+      "docker-compose.yaml"
+    ]);
+
+    if (globalNames.has(fileName)) {
+      return true;
+    }
+    if (relativePathLower.startsWith(".github/") || relativePathLower.startsWith(".vscode/")) {
+      return true;
+    }
+    return /(^|\/)(vite|webpack|babel|eslint|prettier)\.config\.[a-z0-9]+$/.test(relativePathLower);
+  }
+
+  private parsePlan(raw: string, task: string, scopeProfile?: TaskScopeProfile): ExecutionPlan {
+    const scope = scopeProfile ?? this.currentTaskScope ?? this.buildTaskScope(task);
     try {
       const parsed = extractJsonObject(raw) as Record<string, unknown>;
       const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
@@ -1465,39 +1922,20 @@ export class LocalAgentRunner {
       });
 
       if (steps.length === 0) {
-        return {
-          summary: "Fallback plan generated because planner output had no steps.",
-          assumptions: ["Implement directly from user task."],
-          steps: [
-            {
-              id: "S1",
-              title: "Implement request",
-              details: task,
-              status: "pending"
-            }
-          ]
-        };
+        const fallback = this.buildScopedFallbackPlan(task, scope, "Planner returned no steps.");
+        this.callbacks.onLog("PlanScopeGuard: planner returned empty steps. Using scoped fallback plan.");
+        return fallback;
       }
 
-      return {
+      const parsedPlan: ExecutionPlan = {
         summary: toStringValue(parsed.summary, "Execution plan"),
         assumptions: asArray(parsed.assumptions),
         steps
       };
+      return this.enforcePlanScope(parsedPlan, task, scope);
     } catch (error) {
       this.callbacks.onLog(`Plan parse failed, using fallback: ${(error as Error).message}`);
-      return {
-        summary: "Fallback plan due to parser failure.",
-        assumptions: ["Planner returned invalid JSON."],
-        steps: [
-          {
-            id: "S1",
-            title: "Implement request",
-            details: task,
-            status: "pending"
-          }
-        ]
-      };
+      return this.buildScopedFallbackPlan(task, scope, "Planner JSON parse failure.");
     }
   }
 
