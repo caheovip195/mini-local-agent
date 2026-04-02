@@ -1,0 +1,124 @@
+{
+  "name": "local-agent-coder",
+  "displayName": "Local Agent Coder",
+  "description": "Agent + Plan coding assistant for local LM Studio models.",
+  "version": "0.0.9",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.87.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:localAgent.chatView",
+    "onCommand:localAgent.runTask",
+    "onCommand:localAgent.planTask"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localAgent",
+          "title": "Local Agent",
+          "icon": "media/robot.svg"
+        }
+      ]
+    },
+    "views": {
+      "localAgent": [
+        {
+          "type": "webview",
+          "id": "localAgent.chatView",
+          "name": "Agent + Plan"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localAgent.runTask",
+        "title": "Local Agent: Run Task (Plan + Execute)"
+      },
+      {
+        "command": "localAgent.planTask",
+        "title": "Local Agent: Create Plan Only"
+      }
+    ],
+    "configuration": {
+      "title": "Local Agent",
+      "properties": {
+        "localAgent.lmStudio.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:1234/v1",
+          "description": "LM Studio OpenAI-compatible base URL."
+        },
+        "localAgent.lmStudio.apiKey": {
+          "type": "string",
+          "default": "lm-studio",
+          "description": "API key for LM Studio endpoint (LM Studio can accept any placeholder)."
+        },
+        "localAgent.lmStudio.model": {
+          "type": "string",
+          "default": "qwen2.5-coder-7b-instruct",
+          "description": "Model name loaded in LM Studio."
+        },
+        "localAgent.maxTurnsPerStep": {
+          "type": "number",
+          "default": 10,
+          "minimum": 3,
+          "maximum": 30,
+          "description": "Maximum agent turns per plan step."
+        },
+        "localAgent.maxAskUser": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 3,
+          "description": "Maximum times the agent can ask the user in one task."
+        },
+        "localAgent.minInvestigationsBeforeExecute": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "description": "Minimum list/search/read actions before write/run/complete to reduce blind edits."
+        },
+        "localAgent.strategyCandidates": {
+          "type": "number",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 5,
+          "description": "Number of candidate implementation approaches to evaluate before choosing the plan strategy."
+        },
+        "localAgent.commandTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 5000,
+          "maximum": 600000,
+          "description": "Timeout for shell command execution."
+        },
+        "localAgent.autoApplyWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow agent to write files directly."
+        },
+        "localAgent.systemPromptExtra": {
+          "type": "string",
+          "default": "",
+          "description": "Additional system prompt content appended to planner and agent prompts."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/vscode": "^1.87.0",
+    "typescript": "^5.4.5"
+  }
+}
