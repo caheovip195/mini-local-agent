@@ -9,6 +9,7 @@ import type {
   StepStatus
 } from "./agent/types";
 import { LmStudioClient } from "./lmStudioClient";
+import { LocalInlineCompletionProvider } from "./inlineCompletion";
 
 interface RunMode {
   type: "plan" | "agent";
@@ -79,9 +80,14 @@ type WebviewEvent =
     };
 
 interface LmSettings {
+  providerPreset: "lmstudio" | "openrouter" | "custom";
+  providerName: string;
   baseUrl: string;
   apiKey: string;
   model: string;
+  modelsPath: string;
+  chatPath: string;
+  headers: Record<string, string>;
 }
 
 interface UsageTotals {
@@ -124,15 +130,21 @@ const LEARNING_STORAGE_KEY = "localAgent.learningMemory.v1";
 const HISTORY_LIMIT = 40;
 const LEARNING_LIMIT = 60;
 const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.9 activated");
+  output.appendLine("Local Agent Coder v0.0.12 activated");
   const provider = new LocalAgentViewProvider(context, output);
+  const inlineProvider = new LocalInlineCompletionProvider(output);
 
   context.subscriptions.push(
     output,
     vscode.window.registerWebviewViewProvider(LocalAgentViewProvider.viewType, provider),
+    vscode.languages.registerInlineCompletionItemProvider(
+      [{ scheme: "file" }, { scheme: "untitled" }],
+      inlineProvider
+    ),
     vscode.commands.registerCommand("localAgent.runTask", async () => {
       const prompt = await vscode.window.showInputBox({
         prompt: "Enter task for Local Agent",
@@ -294,6 +306,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     await this.persistLmSelection(selectedModel, selectedBaseUrl);
 
     this.output.appendLine(`Task mode=${mode.type}`);
+    this.output.appendLine(`Provider=${lmSettings.providerName}`);
     this.output.appendLine(`Model=${selectedModel}`);
     this.output.appendLine(`BaseURL=${selectedBaseUrl}`);
     this.output.appendLine(`Prompt: ${prompt}`);
@@ -307,9 +320,13 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "status", text: mode.type === "plan" ? "Planning..." : "Planning + executing..." });
 
     const client = new LmStudioClient({
+      providerName: config.providerName,
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
-      model: config.model
+      model: config.model,
+      modelsPath: config.modelsPath,
+      chatPath: config.chatPath,
+      headers: config.headers
     });
 
     let executionSummary =
@@ -960,10 +977,12 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     if (model.trim()) {
       updates.push(cfg.update("lmStudio.model", model, vscode.ConfigurationTarget.Workspace));
+      updates.push(cfg.update("provider.model", model, vscode.ConfigurationTarget.Workspace));
     }
 
     if (baseUrl.trim()) {
       updates.push(cfg.update("lmStudio.baseUrl", baseUrl, vscode.ConfigurationTarget.Workspace));
+      updates.push(cfg.update("provider.baseUrl", baseUrl, vscode.ConfigurationTarget.Workspace));
     }
 
     if (updates.length === 0) {
@@ -984,16 +1003,20 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     try {
       const client = new LmStudioClient({
+        providerName: lm.providerName,
         baseUrl: selectedBaseUrl,
         apiKey: lm.apiKey,
-        model: fallbackModel
+        model: fallbackModel,
+        modelsPath: lm.modelsPath,
+        chatPath: lm.chatPath,
+        headers: lm.headers
       });
 
       const models = await client.listModels();
       const items = models.length > 0 ? models : [fallbackModel];
       const selected = items.includes(fallbackModel) ? fallbackModel : items[0];
       this.output.appendLine(
-        `loadModels ok baseUrl=${selectedBaseUrl} count=${items.length} selected=${selected}`
+        `loadModels ok provider=${lm.providerName} baseUrl=${selectedBaseUrl} count=${items.length} selected=${selected}`
       );
 
       this.post({
@@ -1001,7 +1024,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         items,
         selected,
         baseUrl: selectedBaseUrl,
-        info: `Loaded ${items.length} model(s) from LM Studio.`
+        info: `Loaded ${items.length} model(s) from ${lm.providerName}.`
       });
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
@@ -1097,26 +1120,75 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
   private readLmSettings(): LmSettings {
     const cfg = vscode.workspace.getConfiguration("localAgent");
+    const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
+    const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
+    const legacyModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
+
+    const rawPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
+    const providerPreset: LmSettings["providerPreset"] =
+      rawPreset === "openrouter" || rawPreset === "custom" ? rawPreset : "lmstudio";
+
+    const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
+    const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
+    const providerModel = cfg.get<string>("provider.model", "").trim();
+    const providerModelsPath = this.normalizeApiPath(cfg.get<string>("provider.modelsPath", "/models"), "/models");
+    const providerChatPath = this.normalizeApiPath(
+      cfg.get<string>("provider.chatPath", "/chat/completions"),
+      "/chat/completions"
+    );
+    const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
+
+    const baseDefault = providerPreset === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : legacyBaseUrl;
+    const baseUrl = providerBaseUrl.length > 0 ? providerBaseUrl : baseDefault;
+    const apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+    const model = providerModel.length > 0 ? providerModel : legacyModel;
+
+    const headers: Record<string, string> = { ...extraHeaders };
+    if (providerPreset === "openrouter") {
+      const siteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
+      const appName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
+      if (siteUrl.length > 0) {
+        headers["HTTP-Referer"] = siteUrl;
+      }
+      if (appName.length > 0) {
+        headers["X-Title"] = appName;
+      }
+    }
+
+    const providerName = providerPreset === "openrouter" ? "OpenRouter" : providerPreset === "custom" ? "Custom API" : "LM Studio";
 
     return {
-      baseUrl: cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL),
-      apiKey: cfg.get<string>("lmStudio.apiKey", "lm-studio"),
-      model: cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct")
+      providerPreset,
+      providerName,
+      baseUrl,
+      apiKey,
+      model,
+      modelsPath: providerModelsPath,
+      chatPath: providerChatPath,
+      headers
     };
   }
 
   private readConfig(workspaceRoot: string, lm: LmSettings): {
+    providerName: string;
     baseUrl: string;
     apiKey: string;
     model: string;
+    modelsPath: string;
+    chatPath: string;
+    headers: Record<string, string>;
     agentConfig: AgentConfig;
   } {
     const cfg = vscode.workspace.getConfiguration("localAgent");
 
     return {
+      providerName: lm.providerName,
       baseUrl: lm.baseUrl,
       apiKey: lm.apiKey,
       model: lm.model,
+      modelsPath: lm.modelsPath,
+      chatPath: lm.chatPath,
+      headers: lm.headers,
       agentConfig: {
         workspaceRoot,
         maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 10),
@@ -1128,6 +1200,42 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         extraSystemPrompt: cfg.get<string>("systemPromptExtra", "")
       }
     };
+  }
+
+  private normalizeApiPath(value: string, fallback: string): string {
+    const raw = value.trim();
+    if (!raw) {
+      return fallback;
+    }
+    return raw.startsWith("/") ? raw : `/${raw}`;
+  }
+
+  private parseHeaderJson(raw: string): Record<string, string> {
+    const text = raw.trim();
+    if (!text) {
+      return {};
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+
+      const out: Record<string, string> = {};
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const normalizedKey = key.trim();
+        const normalizedValue = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+        if (!normalizedKey || !normalizedValue) {
+          continue;
+        }
+        out[normalizedKey] = normalizedValue;
+      }
+      return out;
+    } catch {
+      this.output.appendLine("provider.extraHeaders parse failed. Expected JSON object.");
+      return {};
+    }
   }
 
   private getHtml(): string {

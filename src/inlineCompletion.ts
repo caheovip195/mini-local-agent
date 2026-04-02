@@ -1,0 +1,581 @@
+import * as vscode from "vscode";
+
+import { LmStudioClient, type ChatMessage } from "./lmStudioClient";
+import { extractJsonObject } from "./utils";
+
+const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
+const MAX_CACHE_ITEMS = 120;
+const MAX_INLINE_CANDIDATES = 6;
+const COMMENT_WINDOW_LINES = 16;
+const COMMENT_MAX_ITEMS = 10;
+
+interface CacheValue {
+  items: string[];
+  timestamp: number;
+}
+
+export class LocalInlineCompletionProvider implements vscode.InlineCompletionItemProvider {
+  private readonly cache = new Map<string, CacheValue>();
+
+  constructor(private readonly output: vscode.OutputChannel) {}
+
+  async provideInlineCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    _context: vscode.InlineCompletionContext,
+    token: vscode.CancellationToken
+  ): Promise<vscode.InlineCompletionList | vscode.InlineCompletionItem[]> {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    const enabled = cfg.get<boolean>("inline.enabled", true);
+    if (!enabled || token.isCancellationRequested) {
+      return [];
+    }
+
+    const line = document.lineAt(position.line);
+    const linePrefix = line.text.slice(0, position.character);
+    const lineSuffix = line.text.slice(position.character);
+    const minPrefixChars = Math.max(0, cfg.get<number>("inline.minPrefixChars", 1));
+    if (linePrefix.trim().length < minPrefixChars) {
+      return [];
+    }
+
+    const debounceMs = Math.max(0, cfg.get<number>("inline.debounceMs", 180));
+    if (debounceMs > 0) {
+      await this.delay(debounceMs, token);
+      if (token.isCancellationRequested) {
+        return [];
+      }
+    }
+
+    const providerPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
+    const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
+    const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
+    const baseDefault = providerPreset === "openrouter" ? "https://openrouter.ai/api/v1" : legacyBaseUrl;
+    const lmBaseUrl = this.normalizeBaseUrl(providerBaseUrl || baseDefault, baseDefault);
+
+    const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
+    const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
+    const apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+
+    const configuredModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
+    const providerModel = cfg.get<string>("provider.model", "").trim();
+    const inlineModel = cfg.get<string>("inline.model", "").trim();
+    const model = inlineModel.length > 0 ? inlineModel : providerModel || configuredModel;
+    const chatPath = this.normalizeApiPath(cfg.get<string>("provider.chatPath", "/chat/completions"), "/chat/completions");
+    const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
+    const headers: Record<string, string> = { ...extraHeaders };
+    if (providerPreset === "openrouter") {
+      const siteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
+      const appName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
+      if (siteUrl.length > 0) {
+        headers["HTTP-Referer"] = siteUrl;
+      }
+      if (appName.length > 0) {
+        headers["X-Title"] = appName;
+      }
+    }
+    const maxTokens = Math.min(Math.max(cfg.get<number>("inline.maxTokens", 160), 32), 400);
+    const maxContextChars = Math.min(Math.max(cfg.get<number>("inline.maxContextChars", 6000), 1200), 20000);
+    const maxSuggestionChars = Math.min(Math.max(cfg.get<number>("inline.maxSuggestionChars", 800), 80), 4000);
+    const maxCandidates = Math.min(Math.max(cfg.get<number>("inline.maxCandidates", 3), 1), MAX_INLINE_CANDIDATES);
+    const verboseLog = cfg.get<boolean>("inline.verboseLog", false);
+
+    const before = this.collectBeforeContext(document, position, maxContextChars);
+    const after = this.collectAfterContext(document, position, Math.floor(maxContextChars / 2));
+    const fileContext = this.collectWholeFileContext(document, maxContextChars);
+    const nearbyComments = this.collectNearbyComments(document, position, COMMENT_WINDOW_LINES, COMMENT_MAX_ITEMS);
+    const nearbyFunctions = this.collectFunctionCandidates(document, 20);
+    const cursorLine = position.line + 1;
+    const cursorColumn = position.character + 1;
+    const key = this.buildCacheKey(
+      document.uri.toString(),
+      linePrefix,
+      lineSuffix,
+      model,
+      cursorLine,
+      nearbyComments.join("|")
+    );
+    const cached = this.cache.get(key);
+    const now = Date.now();
+
+    if (cached && now - cached.timestamp <= 8000) {
+      return cached.items.map((item) => new vscode.InlineCompletionItem(item, new vscode.Range(position, position)));
+    }
+
+    const client = new LmStudioClient({
+      providerName:
+        providerPreset === "openrouter" ? "OpenRouter" : providerPreset === "custom" ? "Custom API" : "LM Studio",
+      baseUrl: lmBaseUrl,
+      apiKey,
+      model,
+      chatPath,
+      headers
+    });
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: [
+          "You are an inline code completion engine.",
+          "Return STRICT JSON only.",
+          "Schema:",
+          "{",
+          '  "candidates": [',
+          '    { "text": "string", "label": "string" }',
+          "  ]",
+          "}",
+          "Return 1-6 candidates based on intent from cursor and nearby comments.",
+          "Each candidate.text is direct insertion text at cursor.",
+          "Do not include markdown, explanations, or code fences in text.",
+          "Respect existing file structure, naming conventions, and local coding style.",
+          "Prefer function-level completions when nearby comments imply planned function behavior.",
+          "Do not duplicate already-written code before cursor.",
+          "Avoid creating duplicate functions/files with slightly different names.",
+          "Keep suggestion concise but production quality."
+        ].join("\n")
+      },
+      {
+        role: "user",
+        content: [
+          `File path: ${document.uri.fsPath || document.uri.toString()}`,
+          `Language: ${document.languageId}`,
+          `Cursor line: ${cursorLine}`,
+          `Cursor column: ${cursorColumn}`,
+          "",
+          "Current line prefix:",
+          linePrefix || "(empty)",
+          "",
+          "Current line suffix:",
+          lineSuffix || "(empty)",
+          "",
+          "Nearby user comments around cursor:",
+          nearbyComments.length > 0 ? nearbyComments.join("\n") : "(none)",
+          "",
+          "Existing function candidates in file:",
+          nearbyFunctions.length > 0 ? nearbyFunctions.join("\n") : "(none)",
+          "",
+          "Code before cursor (local context):",
+          before || "(empty)",
+          "",
+          "Code after cursor (local context):",
+          after || "(empty)",
+          "",
+          "Current file content snapshot:",
+          fileContext || "(empty file)",
+          "",
+          `Return up to ${maxCandidates} candidates in JSON now.`
+        ].join("\n")
+      }
+    ];
+
+    const abortController = new AbortController();
+    const cancelSub = token.onCancellationRequested(() => abortController.abort());
+
+    try {
+      const response = await client.chat(messages, abortController.signal, {
+        model,
+        temperature: 0.08,
+        maxTokens
+      });
+
+      const suggestions = this.parseModelCandidates(
+        response.content,
+        linePrefix,
+        lineSuffix,
+        maxSuggestionChars,
+        maxCandidates
+      );
+      if (suggestions.length === 0) {
+        return [];
+      }
+
+      if (verboseLog) {
+        this.output.appendLine(
+          `inline suggest file=${document.uri.fsPath || document.uri.toString()} model=${model} candidates=${suggestions.length}`
+        );
+      }
+
+      this.setCache(key, suggestions);
+      return suggestions.map((item) => new vscode.InlineCompletionItem(item, new vscode.Range(position, position)));
+    } catch (error) {
+      if (token.isCancellationRequested) {
+        return [];
+      }
+
+      if (verboseLog) {
+        const text = error instanceof Error ? error.message : String(error);
+        this.output.appendLine(`inline suggest failed: ${text}`);
+      }
+      return [];
+    } finally {
+      cancelSub.dispose();
+    }
+  }
+
+  private parseModelCandidates(
+    raw: string,
+    linePrefix: string,
+    lineSuffix: string,
+    maxSuggestionChars: number,
+    maxCandidates: number
+  ): string[] {
+    const candidates: string[] = [];
+
+    try {
+      const parsed = extractJsonObject(raw);
+      if (parsed && typeof parsed === "object") {
+        const row = parsed as Record<string, unknown>;
+        const arr = Array.isArray(row.candidates) ? row.candidates : [];
+        for (const item of arr) {
+          if (typeof item === "string") {
+            candidates.push(item);
+            continue;
+          }
+          if (item && typeof item === "object") {
+            const text = (item as Record<string, unknown>).text;
+            if (typeof text === "string" && text.trim().length > 0) {
+              candidates.push(text);
+            }
+          }
+        }
+
+        const primary = row.primary;
+        if (typeof primary === "string" && primary.trim().length > 0) {
+          candidates.unshift(primary);
+        }
+      }
+    } catch {
+      // fallback below
+    }
+
+    if (candidates.length === 0) {
+      candidates.push(raw);
+    }
+
+    const normalized: string[] = [];
+    const seen = new Set<string>();
+
+    for (const item of candidates) {
+      const text = this.normalizeSuggestion(item, linePrefix, lineSuffix, maxSuggestionChars);
+      if (!text || seen.has(text)) {
+        continue;
+      }
+      seen.add(text);
+      normalized.push(text);
+      if (normalized.length >= maxCandidates) {
+        break;
+      }
+    }
+
+    return normalized;
+  }
+
+  private normalizeSuggestion(
+    raw: string,
+    linePrefix: string,
+    lineSuffix: string,
+    maxSuggestionChars: number
+  ): string {
+    let text = raw.replace(/\r\n/g, "\n").trim();
+    if (!text) {
+      return "";
+    }
+
+    const fenced = text.match(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)```$/);
+    if (fenced && fenced[1]) {
+      text = fenced[1].trim();
+    }
+
+    text = text.replace(/^Here(?:'s| is).*\n/i, "");
+    text = text.replace(/^\s*[-*]\s+/gm, "");
+    text = text.replace(/^\d+\.\s+/gm, "");
+
+    const lastPrefixLine = linePrefix.split("\n").pop() || "";
+    if (lastPrefixLine && text.startsWith(lastPrefixLine)) {
+      text = text.slice(lastPrefixLine.length);
+    }
+
+    if (lineSuffix && text.startsWith(lineSuffix)) {
+      return "";
+    }
+
+    if (!text) {
+      return "";
+    }
+
+    if (text.length > maxSuggestionChars) {
+      text = text.slice(0, maxSuggestionChars);
+    }
+
+    return text;
+  }
+
+  private collectWholeFileContext(document: vscode.TextDocument, maxChars: number): string {
+    const text = document.getText();
+    if (text.length <= maxChars) {
+      return text;
+    }
+
+    const half = Math.floor(maxChars / 2);
+    return `${text.slice(0, half)}\n...<truncated>...\n${text.slice(text.length - half)}`;
+  }
+
+  private collectNearbyComments(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    windowLines: number,
+    limit: number
+  ): string[] {
+    const start = Math.max(0, position.line - windowLines);
+    const end = Math.min(document.lineCount - 1, position.line + windowLines);
+    const comments: string[] = [];
+
+    for (let i = start; i <= end; i += 1) {
+      const raw = document.lineAt(i).text.trim();
+      if (!raw) {
+        continue;
+      }
+
+      let comment = "";
+      if (raw.startsWith("//")) {
+        comment = raw.slice(2).trim();
+      } else if (raw.startsWith("#")) {
+        comment = raw.slice(1).trim();
+      } else if (raw.startsWith("--")) {
+        comment = raw.slice(2).trim();
+      } else if (raw.startsWith("/*")) {
+        comment = raw.replace(/^\/\*\s*/, "").replace(/\*\/$/, "").trim();
+      } else if (raw.startsWith("*")) {
+        comment = raw.replace(/^\*\s*/, "").trim();
+      }
+
+      if (!comment) {
+        continue;
+      }
+
+      comments.push(`L${i + 1}: ${comment}`);
+      if (comments.length >= limit) {
+        break;
+      }
+    }
+
+    return comments;
+  }
+
+  private collectFunctionCandidates(document: vscode.TextDocument, limit: number): string[] {
+    const lines = document.getText().split(/\r?\n/g);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const bannedPrefixes = ["if", "for", "while", "switch", "catch", "return"];
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.length > 220) {
+        continue;
+      }
+
+      const looksFunctionLike =
+        /^function\s+[A-Za-z_]\w*\s*\(/.test(trimmed) ||
+        /^(const|let|var)\s+[A-Za-z_]\w*\s*=\s*(async\s*)?\(/.test(trimmed) ||
+        /^\s*(public|private|protected)?\s*(async\s+)?[A-Za-z_]\w*\s*\([^)]*\)\s*\{?/.test(trimmed) ||
+        /^def\s+[A-Za-z_]\w*\s*\(/.test(trimmed) ||
+        /^func\s+[A-Za-z_]\w*\s*\(/.test(trimmed);
+
+      if (!looksFunctionLike) {
+        continue;
+      }
+
+      const lower = trimmed.toLowerCase();
+      if (bannedPrefixes.some((prefix) => lower.startsWith(`${prefix} `))) {
+        continue;
+      }
+
+      if (seen.has(trimmed)) {
+        continue;
+      }
+
+      seen.add(trimmed);
+      out.push(trimmed);
+      if (out.length >= limit) {
+        break;
+      }
+    }
+
+    return out;
+  }
+
+  private collectBeforeContext(document: vscode.TextDocument, position: vscode.Position, maxChars: number): string {
+    const startLine = Math.max(0, position.line - 160);
+    const parts: string[] = [];
+
+    for (let line = startLine; line <= position.line; line += 1) {
+      const content = document.lineAt(line).text;
+      if (line === position.line) {
+        parts.push(content.slice(0, position.character));
+      } else {
+        parts.push(content);
+      }
+    }
+
+    let text = parts.join("\n");
+    if (text.length > maxChars) {
+      text = text.slice(text.length - maxChars);
+    }
+    return text;
+  }
+
+  private collectAfterContext(document: vscode.TextDocument, position: vscode.Position, maxChars: number): string {
+    const endLine = Math.min(document.lineCount - 1, position.line + 100);
+    const parts: string[] = [];
+
+    for (let line = position.line; line <= endLine; line += 1) {
+      const content = document.lineAt(line).text;
+      if (line === position.line) {
+        parts.push(content.slice(position.character));
+      } else {
+        parts.push(content);
+      }
+    }
+
+    let text = parts.join("\n");
+    if (text.length > maxChars) {
+      text = text.slice(0, maxChars);
+    }
+    return text;
+  }
+
+  private setCache(key: string, items: string[]): void {
+    this.cache.set(key, {
+      items,
+      timestamp: Date.now()
+    });
+
+    if (this.cache.size <= MAX_CACHE_ITEMS) {
+      return;
+    }
+
+    const oldest = this.cache.keys().next().value;
+    if (oldest) {
+      this.cache.delete(oldest);
+    }
+  }
+
+  private buildCacheKey(
+    uri: string,
+    prefix: string,
+    suffix: string,
+    model: string,
+    line: number,
+    comments: string
+  ): string {
+    const prefixTail = prefix.slice(-180);
+    const suffixHead = suffix.slice(0, 80);
+    const commentsTail = comments.slice(-200);
+    return `${uri}|${model}|L${line}|${prefixTail}|${suffixHead}|${commentsTail}`;
+  }
+
+  private async delay(ms: number, token: vscode.CancellationToken): Promise<void> {
+    if (ms <= 0 || token.isCancellationRequested) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        sub.dispose();
+        resolve();
+      }, ms);
+
+      const sub = token.onCancellationRequested(() => {
+        clearTimeout(timer);
+        sub.dispose();
+        resolve();
+      });
+    });
+  }
+
+  private normalizeBaseUrl(input: string, fallback: string): string {
+    const primary = this.sanitizeBaseUrlToken(input);
+    const fallbackToken = this.sanitizeBaseUrlToken(fallback);
+
+    const primaryNormalized = this.canonicalizeBaseUrl(primary);
+    if (primaryNormalized) {
+      return primaryNormalized;
+    }
+
+    const fallbackNormalized = this.canonicalizeBaseUrl(fallbackToken);
+    if (fallbackNormalized) {
+      return fallbackNormalized;
+    }
+
+    return DEFAULT_LM_BASE_URL;
+  }
+
+  private normalizeApiPath(value: string, fallback: string): string {
+    const raw = value.trim();
+    if (!raw) {
+      return fallback;
+    }
+    return raw.startsWith("/") ? raw : `/${raw}`;
+  }
+
+  private parseHeaderJson(raw: string): Record<string, string> {
+    const text = raw.trim();
+    if (!text) {
+      return {};
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+
+      const out: Record<string, string> = {};
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const normalizedKey = key.trim();
+        const normalizedValue = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+        if (!normalizedKey || !normalizedValue) {
+          continue;
+        }
+        out[normalizedKey] = normalizedValue;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  private sanitizeBaseUrlToken(value: string): string {
+    return value.trim().replace(/^['"]+|['"]+$/g, "").trim();
+  }
+
+  private canonicalizeBaseUrl(raw: string): string | undefined {
+    if (!raw) {
+      return undefined;
+    }
+
+    let normalized = raw.replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(normalized)) {
+      normalized = `http://${normalized}`;
+    }
+
+    try {
+      const parsed = new URL(normalized);
+      parsed.hash = "";
+      parsed.search = "";
+
+      const pathname = parsed.pathname.replace(/\/+$/, "");
+      if (!pathname || pathname === "/") {
+        parsed.pathname = "/v1";
+      } else if (!/\/v1$/i.test(pathname)) {
+        parsed.pathname = `${pathname}/v1`;
+      } else {
+        parsed.pathname = pathname;
+      }
+
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    } catch {
+      return undefined;
+    }
+  }
+}

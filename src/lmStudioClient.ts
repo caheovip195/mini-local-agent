@@ -7,6 +7,12 @@ interface ClientOptions {
   baseUrl: string;
   apiKey: string;
   model: string;
+  providerName?: string;
+  modelsPath?: string;
+  chatPath?: string;
+  apiKeyHeader?: string;
+  apiKeyPrefix?: string;
+  headers?: Record<string, string>;
 }
 
 interface ChatOptions {
@@ -57,11 +63,28 @@ interface ModelsResponse {
 export class LmStudioClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly providerName: string;
+  private readonly modelsPath: string;
+  private readonly chatPath: string;
+  private readonly apiKeyHeader: string;
+  private readonly apiKeyPrefix: string;
+  private readonly headers: Record<string, string>;
   private model: string;
 
   constructor(options: ClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
+    this.providerName = options.providerName?.trim() || "Provider";
+    this.modelsPath = this.normalizePath(options.modelsPath, "/models");
+    this.chatPath = this.normalizePath(options.chatPath, "/chat/completions");
+    this.apiKeyHeader = options.apiKeyHeader?.trim() || "Authorization";
+    this.apiKeyPrefix =
+      typeof options.apiKeyPrefix === "string"
+        ? options.apiKeyPrefix
+        : this.apiKeyHeader.toLowerCase() === "authorization"
+          ? "Bearer "
+          : "";
+    this.headers = this.normalizeHeaders(options.headers);
     this.model = options.model;
   }
 
@@ -77,18 +100,15 @@ export class LmStudioClient {
   }
 
   async listModels(signal?: AbortSignal): Promise<string[]> {
-    const response = await fetch(`${this.baseUrl}/models`, {
+    const response = await fetch(this.joinUrl(this.modelsPath), {
       method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`
-      },
+      headers: this.buildHeaders(false),
       signal
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`LM Studio models error ${response.status}: ${errorText}`);
+      throw new Error(`${this.providerName} models error ${response.status}: ${errorText}`);
     }
 
     const data = (await response.json()) as ModelsResponse;
@@ -109,12 +129,9 @@ export class LmStudioClient {
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        const response = await fetch(this.joinUrl(this.chatPath), {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${this.apiKey}`
-          },
+          headers: this.buildHeaders(true),
           body: JSON.stringify({
             model: requestedModel,
             messages,
@@ -127,7 +144,7 @@ export class LmStudioClient {
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`LM Studio error ${response.status}: ${errorText}`);
+          throw new Error(`${this.providerName} error ${response.status}: ${errorText}`);
         }
 
         const data = (await response.json()) as ChatCompletionResponse;
@@ -146,7 +163,7 @@ export class LmStudioClient {
         };
       } catch (error) {
         if (signal?.aborted) {
-          throw new Error("LM Studio request cancelled.");
+          throw new Error(`${this.providerName} request cancelled.`);
         }
 
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -158,7 +175,7 @@ export class LmStudioClient {
       }
     }
 
-    throw lastError ?? new Error("LM Studio request failed.");
+    throw lastError ?? new Error(`${this.providerName} request failed.`);
   }
 
   private extractCompletionContent(data: ChatCompletionResponse): string | undefined {
@@ -275,7 +292,7 @@ export class LmStudioClient {
       const onAbort = (): void => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        reject(new Error("LM Studio request cancelled."));
+        reject(new Error(`${this.providerName} request cancelled.`));
       };
 
       if (signal?.aborted) {
@@ -285,5 +302,50 @@ export class LmStudioClient {
 
       signal?.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  private joinUrl(pathname: string): string {
+    return `${this.baseUrl}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
+  }
+
+  private normalizePath(pathname: string | undefined, fallback: string): string {
+    const value = pathname?.trim();
+    if (!value) {
+      return fallback;
+    }
+    return value.startsWith("/") ? value : `/${value}`;
+  }
+
+  private normalizeHeaders(value: Record<string, string> | undefined): Record<string, string> {
+    if (!value) {
+      return {};
+    }
+
+    const out: Record<string, string> = {};
+    for (const [rawKey, rawVal] of Object.entries(value)) {
+      const key = rawKey.trim();
+      const val = String(rawVal ?? "").trim();
+      if (!key || !val) {
+        continue;
+      }
+      out[key] = val;
+    }
+    return out;
+  }
+
+  private buildHeaders(withJsonContentType: boolean): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (withJsonContentType) {
+      headers["Content-Type"] = "application/json";
+    }
+
+    if (this.apiKey.trim().length > 0) {
+      headers[this.apiKeyHeader] = `${this.apiKeyPrefix}${this.apiKey}`;
+    }
+
+    return {
+      ...headers,
+      ...this.headers
+    };
   }
 }

@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.9",
+  "version": "0.0.12",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -11,6 +11,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:localAgent.chatView",
     "onCommand:localAgent.runTask",
     "onCommand:localAgent.planTask"
@@ -62,6 +63,109 @@
           "type": "string",
           "default": "qwen2.5-coder-7b-instruct",
           "description": "Model name loaded in LM Studio."
+        },
+        "localAgent.provider.preset": {
+          "type": "string",
+          "enum": ["lmstudio", "openrouter", "custom"],
+          "default": "lmstudio",
+          "description": "Backend provider preset. 'custom' works with any OpenAI-compatible API."
+        },
+        "localAgent.provider.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Override base URL for provider preset (for example https://openrouter.ai/api/v1 or other OpenAI-compatible endpoints)."
+        },
+        "localAgent.provider.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Override API key for provider preset. Leave empty to reuse localAgent.lmStudio.apiKey."
+        },
+        "localAgent.provider.model": {
+          "type": "string",
+          "default": "",
+          "description": "Override model name for provider preset. Leave empty to reuse localAgent.lmStudio.model."
+        },
+        "localAgent.provider.modelsPath": {
+          "type": "string",
+          "default": "/models",
+          "description": "Path for model list endpoint on OpenAI-compatible APIs."
+        },
+        "localAgent.provider.chatPath": {
+          "type": "string",
+          "default": "/chat/completions",
+          "description": "Path for chat completion endpoint on OpenAI-compatible APIs."
+        },
+        "localAgent.provider.extraHeaders": {
+          "type": "string",
+          "default": "{}",
+          "description": "Extra HTTP headers as JSON object string. Example: {\"X-Key\":\"value\"}"
+        },
+        "localAgent.provider.openRouterSiteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional HTTP-Referer sent when using OpenRouter preset."
+        },
+        "localAgent.provider.openRouterAppName": {
+          "type": "string",
+          "default": "Local Agent Coder",
+          "description": "Optional X-Title sent when using OpenRouter preset."
+        },
+        "localAgent.inline.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline code completion in editor (Copilot-like ghost text)."
+        },
+        "localAgent.inline.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model override for inline completion. Empty uses localAgent.lmStudio.model."
+        },
+        "localAgent.inline.debounceMs": {
+          "type": "number",
+          "default": 180,
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "Debounce delay before requesting inline completion."
+        },
+        "localAgent.inline.maxTokens": {
+          "type": "number",
+          "default": 160,
+          "minimum": 32,
+          "maximum": 400,
+          "description": "Maximum completion tokens for inline suggestions."
+        },
+        "localAgent.inline.maxContextChars": {
+          "type": "number",
+          "default": 6000,
+          "minimum": 1200,
+          "maximum": 20000,
+          "description": "Maximum context characters sent to model for inline completion."
+        },
+        "localAgent.inline.maxSuggestionChars": {
+          "type": "number",
+          "default": 800,
+          "minimum": 80,
+          "maximum": 4000,
+          "description": "Maximum characters returned for one inline suggestion."
+        },
+        "localAgent.inline.maxCandidates": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "description": "Number of inline completion candidates returned for cycling suggestions."
+        },
+        "localAgent.inline.minPrefixChars": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 12,
+          "description": "Minimum non-space chars before cursor required to trigger inline suggestion."
+        },
+        "localAgent.inline.verboseLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write inline completion debug logs to Local Agent Coder output."
         },
         "localAgent.maxTurnsPerStep": {
           "type": "number",
