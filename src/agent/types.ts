@@ -26,6 +26,7 @@ export interface AgentDecision {
 export interface AgentConfig {
   workspaceRoot: string;
   maxTurnsPerStep: number;
+  executorMaxTokens: number;
   maxAskUser: number;
   minInvestigationsBeforeExecute: number;
   strategyCandidates: number;
@@ -60,6 +61,15 @@ export interface AgentActionEvent {
   detail: string;
 }
 
+export interface AgentStreamEvent {
+  phase: "executor";
+  stepId: string;
+  turn: number;
+  streamId: string;
+  text: string;
+  done: boolean;
+}
+
 export interface RunnerCallbacks {
   onLog: (message: string) => void;
   onStatus: (message: string) => void;
@@ -68,5 +78,6 @@ export interface RunnerCallbacks {
   onDone: (summary: string) => void;
   onUsage?: (event: AgentUsageEvent) => void;
   onAction?: (event: AgentActionEvent) => void;
+  onStream?: (event: AgentStreamEvent) => void;
   onQuestion?: (question: string) => Promise<string>;
 }

@@ -54,6 +54,15 @@ type WebviewEvent =
       detail: string;
     }
   | {
+      type: "stream";
+      phase: "executor";
+      stepId: string;
+      turn: number;
+      streamId: string;
+      text: string;
+      done: boolean;
+    }
+  | {
       type: "run_context";
       mode: RunMode["type"];
       model: string;
@@ -77,7 +86,8 @@ type WebviewEvent =
         }>;
         status: "done" | "error" | "cancelled";
       }>;
-    };
+    }
+  | { type: "session_cleared" };
 
 interface LmSettings {
   providerPreset: "lmstudio" | "openrouter" | "custom";
@@ -88,6 +98,7 @@ interface LmSettings {
   modelsPath: string;
   chatPath: string;
   headers: Record<string, string>;
+  quickOpenRouter: boolean;
 }
 
 interface UsageTotals {
@@ -134,7 +145,7 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.13 activated");
+  output.appendLine("Local Agent Coder v0.0.22 activated");
   const provider = new LocalAgentViewProvider(context, output);
   const inlineProvider = new LocalInlineCompletionProvider(output);
 
@@ -166,6 +177,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       await vscode.commands.executeCommand("workbench.view.extension.localAgent");
       await provider.run(prompt, { type: "plan" });
+    }),
+    vscode.commands.registerCommand("localAgent.setupOpenRouterSimple", async () => {
+      await provider.setupOpenRouterSimple();
     })
   );
 }
@@ -185,6 +199,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   private usageTotals: UsageTotals = { prompt: 0, completion: 0, total: 0 };
   private history: ConversationHistoryEntry[] = [];
   private learningMemory: LearningMemoryEntry[] = [];
+  private sessionResetAtMs = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -251,6 +266,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         this.postHistory();
       }
 
+      if (type === "clear_session") {
+        this.clearSession();
+      }
+
       if (type === "client_error") {
         const text = typeof payload.text === "string" ? payload.text : "Unknown webview error.";
         this.output.appendLine(`Webview error: ${text}`);
@@ -276,6 +295,55 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     this.postHistory();
   }
 
+  async setupOpenRouterSimple(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    const existingKey = cfg.get<string>("openRouter.apiKey", "").trim();
+    const existingModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim() || "openrouter/auto";
+
+    const keyInput = await vscode.window.showInputBox({
+      prompt: "OpenRouter API key",
+      placeHolder: "sk-or-v1-...",
+      password: true,
+      ignoreFocusOut: true
+    });
+    if (keyInput === undefined) {
+      return;
+    }
+
+    const nextApiKey = keyInput.trim().length > 0 ? keyInput.trim() : existingKey;
+    if (!nextApiKey) {
+      vscode.window.showErrorMessage("OpenRouter API key is required.");
+      return;
+    }
+
+    const modelInput = await vscode.window.showInputBox({
+      prompt: "OpenRouter model (simple mode)",
+      placeHolder: "openrouter/auto",
+      value: existingModel,
+      ignoreFocusOut: true
+    });
+    if (modelInput === undefined) {
+      return;
+    }
+    const nextModel = modelInput.trim() || "openrouter/auto";
+
+    try {
+      await Promise.all([
+        cfg.update("openRouter.simpleMode", true, vscode.ConfigurationTarget.Workspace),
+        cfg.update("openRouter.apiKey", nextApiKey, vscode.ConfigurationTarget.Workspace),
+        cfg.update("openRouter.model", nextModel, vscode.ConfigurationTarget.Workspace),
+        cfg.update("provider.preset", "openrouter", vscode.ConfigurationTarget.Workspace)
+      ]);
+      this.output.appendLine(`OpenRouter simple setup saved. model=${nextModel}`);
+      void this.loadModels(nextModel, DEFAULT_OPENROUTER_BASE_URL);
+      vscode.window.showInformationMessage("OpenRouter simple mode is enabled.");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`OpenRouter simple setup failed: ${text}`);
+      vscode.window.showErrorMessage(`OpenRouter setup failed: ${text}`);
+    }
+  }
+
   async run(
     prompt: string,
     mode: RunMode,
@@ -294,6 +362,14 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     const lmSettings = this.readLmSettings();
+    if (lmSettings.providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(lmSettings.apiKey)) {
+      this.post({
+        type: "error",
+        text:
+          "OpenRouter API key is missing. Set localAgent.openRouter.apiKey (simple mode) or localAgent.provider.apiKey."
+      });
+      return;
+    }
     const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : lmSettings.model;
     const selectedBaseUrl = this.normalizeBaseUrl(baseUrlOverride || lmSettings.baseUrl, lmSettings.baseUrl);
 
@@ -380,6 +456,17 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           actionType: event.actionType,
           status: event.status,
           detail: event.detail
+        });
+      },
+      onStream: (event) => {
+        this.post({
+          type: "stream",
+          phase: event.phase,
+          stepId: event.stepId,
+          turn: event.turn,
+          streamId: event.streamId,
+          text: event.text,
+          done: event.done
         });
       },
       onQuestion: async (question) => {
@@ -472,6 +559,19 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private clearSession(): void {
+    if (this.running) {
+      this.post({ type: "error", text: "Stop current run before clearing session." });
+      return;
+    }
+
+    this.sessionResetAtMs = Date.now();
+    this.resetUsage();
+    this.post({ type: "session_cleared" });
+    this.post({ type: "status", text: "Session cleared. Ready for a new request." });
+    this.output.appendLine(`Session cleared at ${new Date(this.sessionResetAtMs).toISOString()}`);
+  }
+
   private resetUsage(): void {
     this.usageTotals = { prompt: 0, completion: 0, total: 0 };
     this.post({ type: "usage_reset" });
@@ -511,16 +611,19 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     mode: RunMode,
     signal: AbortSignal
   ): Promise<{ compactTask: string; preflightSummary: string }> {
-    const unfinishedEntry = this.getMostRecentUnfinishedEntry();
+    const sessionHistory = this.getActiveSessionHistoryEntries();
+    const unfinishedEntry = this.getMostRecentUnfinishedEntry(sessionHistory);
     const continuationIntent = this.isContinuationIntent(prompt);
-    const learningRules = this.getLearningRulesForPrompt(8);
+    const relatedHistory = this.selectRelevantHistoryEntries(prompt, sessionHistory, 10);
+    const hasRelatedHistory =
+      continuationIntent && unfinishedEntry ? true : relatedHistory.length > 0;
+    const learningRules = this.getLearningRulesForPrompt(prompt, 8);
     const learningRulesBlock =
       learningRules.length > 0
         ? learningRules.map((rule, index) => `${index + 1}. ${rule}`).join("\n")
         : "(No project learning rules yet)";
 
-    const recentHistory = this.history
-      .slice(-10)
+    const recentHistory = relatedHistory
       .map((entry, index) => {
         const remaining =
           entry.remainingSteps.length > 0
@@ -541,7 +644,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       })
       .join("\n\n");
 
-    const historyBlock = recentHistory.trim().length > 0 ? recentHistory : "(No prior history)";
+    const historyBlock =
+      recentHistory.trim().length > 0 ? recentHistory : "(No related prior history for this request)";
     const unfinishedBlock =
       unfinishedEntry && unfinishedEntry.remainingSteps.length > 0
         ? [
@@ -551,6 +655,33 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
             this.formatRemainingSteps(unfinishedEntry.remainingSteps, 8)
           ].join("\n")
         : "(No unfinished run context)";
+
+    this.output.appendLine(
+      `Preflight context selection: sessionHistory=${sessionHistory.length} relatedHistory=${relatedHistory.length} continuation=${continuationIntent ? "yes" : "no"}`
+    );
+
+    if (!hasRelatedHistory && !continuationIntent) {
+      const executionBrief =
+        "No related prior conversation detected. Use only current request. Investigate workspace first, then execute without loops.";
+      const preflightSummary = [
+        "Conversation: (No related prior context used.)",
+        `Current: ${prompt}`,
+        `Brief: ${executionBrief}`
+      ].join("\n");
+
+      const compactTask = [
+        "Conversation memory summary:",
+        "(No related prior context. Start fresh.)",
+        "",
+        `Current request:\n${prompt}`,
+        "",
+        `Execution brief:\n${executionBrief}`,
+        "",
+        `Original user request:\n${prompt}`
+      ].join("\n");
+
+      return { compactTask, preflightSummary };
+    }
 
     const preflightResponse = await client.chat(
       [
@@ -759,17 +890,76 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       .slice(0, 14);
   }
 
-  private getMostRecentUnfinishedEntry(): ConversationHistoryEntry | undefined {
-    const reversed = [...this.history].reverse();
+  private getMostRecentUnfinishedEntry(
+    source: ConversationHistoryEntry[] = this.history
+  ): ConversationHistoryEntry | undefined {
+    const reversed = [...source].reverse();
     return reversed.find((entry) => entry.remainingSteps.length > 0);
   }
 
-  private getLearningRulesForPrompt(limit: number): string[] {
+  private getActiveSessionHistoryEntries(): ConversationHistoryEntry[] {
+    if (this.sessionResetAtMs <= 0) {
+      return this.history;
+    }
+    return this.history.filter((entry) => this.toTimestampMs(entry.timestamp) >= this.sessionResetAtMs);
+  }
+
+  private selectRelevantHistoryEntries(
+    prompt: string,
+    source: ConversationHistoryEntry[],
+    limit: number
+  ): ConversationHistoryEntry[] {
+    if (source.length === 0) {
+      return [];
+    }
+
+    const promptTerms = this.extractSemanticTerms(prompt);
+    if (promptTerms.length === 0) {
+      return source.slice(-Math.max(1, limit));
+    }
+
+    const promptSet = new Set(promptTerms);
+    const scored = source
+      .map((entry, index) => {
+        const context = [
+          entry.userPrompt,
+          entry.preflightSummary,
+          entry.runSummary,
+          entry.learningNote,
+          entry.remainingSteps.map((step) => `${step.id} ${step.title} ${step.details}`).join(" ")
+        ]
+          .filter(Boolean)
+          .join("\n");
+        const score = this.computeSemanticOverlap(promptSet, context);
+        const directContainment =
+          this.containsNormalizedText(prompt, entry.userPrompt) ||
+          this.containsNormalizedText(entry.userPrompt, prompt);
+        return {
+          entry,
+          index,
+          score: directContainment ? Math.max(score, 0.24) : score
+        };
+      })
+      .filter((row) => row.score >= 0.14)
+      .sort((a, b) => b.score - a.score || b.index - a.index)
+      .slice(0, Math.max(1, limit));
+
+    return scored.map((row) => row.entry);
+  }
+
+  private getLearningRulesForPrompt(prompt: string, limit: number): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
     const recent = [...this.learningMemory].slice(-12).reverse();
+    const promptTerms = new Set(this.extractSemanticTerms(prompt));
 
     for (const item of recent) {
+      const context = [item.task, item.lesson, item.rules.join(" ")].join("\n");
+      const overlap = this.computeSemanticOverlap(promptTerms, context);
+      if (promptTerms.size > 0 && overlap < 0.12) {
+        continue;
+      }
+
       for (const rule of item.rules) {
         const normalized = rule.trim();
         if (!normalized || seen.has(normalized)) {
@@ -784,6 +974,89 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     return out;
+  }
+
+  private extractSemanticTerms(text: string): string[] {
+    const lower = text.toLowerCase();
+    const tokens = lower.match(/[\p{L}\p{N}_-]{3,}/gu) ?? [];
+    const stopWords = new Set([
+      "the",
+      "and",
+      "for",
+      "with",
+      "from",
+      "into",
+      "this",
+      "that",
+      "have",
+      "has",
+      "your",
+      "about",
+      "task",
+      "request",
+      "please",
+      "current",
+      "history",
+      "continue",
+      "resume",
+      "make",
+      "just",
+      "only",
+      "lam",
+      "tiep",
+      "yeu",
+      "cau",
+      "cho",
+      "toi",
+      "nay",
+      "cua",
+      "nhung",
+      "cac",
+      "va",
+      "mot"
+    ]);
+
+    const out: string[] = [];
+    for (const token of tokens) {
+      const normalized = token.trim();
+      if (!normalized || stopWords.has(normalized) || /^\d+$/.test(normalized)) {
+        continue;
+      }
+      out.push(normalized);
+    }
+
+    return Array.from(new Set(out)).slice(0, 40);
+  }
+
+  private computeSemanticOverlap(promptTerms: Set<string>, text: string): number {
+    if (promptTerms.size === 0) {
+      return 0;
+    }
+    const terms = new Set(this.extractSemanticTerms(text));
+    if (terms.size === 0) {
+      return 0;
+    }
+    let hits = 0;
+    for (const token of promptTerms) {
+      if (terms.has(token)) {
+        hits += 1;
+      }
+    }
+    return hits / Math.max(promptTerms.size, terms.size);
+  }
+
+  private containsNormalizedText(source: string, needle: string): boolean {
+    const sourceText = source.trim().toLowerCase();
+    const needleText = needle.trim().toLowerCase();
+    if (!sourceText || !needleText) {
+      return false;
+    }
+    return sourceText.includes(needleText);
+  }
+
+  private toTimestampMs(value: string): number {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   private async buildLearningNote(
@@ -974,10 +1247,14 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   private async persistLmSelection(model: string, baseUrl: string): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("localAgent");
     const updates: Array<Thenable<unknown>> = [];
+    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
 
     if (model.trim()) {
       updates.push(cfg.update("lmStudio.model", model, vscode.ConfigurationTarget.Workspace));
       updates.push(cfg.update("provider.model", model, vscode.ConfigurationTarget.Workspace));
+      if (quickOpenRouter) {
+        updates.push(cfg.update("openRouter.model", model, vscode.ConfigurationTarget.Workspace));
+      }
     }
 
     if (baseUrl.trim()) {
@@ -1000,6 +1277,19 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const lm = this.readLmSettings();
     const selectedBaseUrl = this.normalizeBaseUrl(baseUrlOverride || lm.baseUrl, lm.baseUrl);
     const fallbackModel = preferredModel || lm.model;
+    if (lm.providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(lm.apiKey)) {
+      const message =
+        "OpenRouter API key is missing. Set localAgent.openRouter.apiKey (simple mode) or localAgent.provider.apiKey.";
+      this.output.appendLine(`loadModels blocked: ${message}`);
+      this.post({
+        type: "models",
+        items: [fallbackModel],
+        selected: fallbackModel,
+        baseUrl: selectedBaseUrl,
+        error: message
+      });
+      return;
+    }
 
     try {
       const client = new LmStudioClient({
@@ -1037,6 +1327,15 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         error: `Could not load models: ${text}`
       });
     }
+  }
+
+  private isMissingOpenRouterApiKey(value: string): boolean {
+    const key = value.trim();
+    if (!key) {
+      return true;
+    }
+    const placeholder = new Set(["lm-studio", "your-openrouter-key", "changeme", "none"]);
+    return placeholder.has(key.toLowerCase());
   }
 
   private normalizeBaseUrl(input: string, fallback: string): string {
@@ -1123,10 +1422,16 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
     const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
     const legacyModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
+    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
+    const quickOpenRouterApiKey = cfg.get<string>("openRouter.apiKey", "").trim();
+    const quickOpenRouterModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim();
+    const quickOpenRouterSiteUrl = cfg.get<string>("openRouter.siteUrl", "").trim();
+    const quickOpenRouterAppName = cfg.get<string>("openRouter.appName", "Local Agent Coder").trim();
 
     const rawPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const providerPreset: LmSettings["providerPreset"] =
+    const configuredPreset: LmSettings["providerPreset"] =
       rawPreset === "openrouter" || rawPreset === "custom" ? rawPreset : "lmstudio";
+    const providerPreset: LmSettings["providerPreset"] = quickOpenRouter ? "openrouter" : configuredPreset;
 
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
     const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
@@ -1139,14 +1444,30 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
 
     const baseDefault = providerPreset === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : legacyBaseUrl;
-    const baseUrl = providerBaseUrl.length > 0 ? providerBaseUrl : baseDefault;
-    const apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
-    const model = providerModel.length > 0 ? providerModel : legacyModel;
+    const baseUrl = quickOpenRouter
+      ? DEFAULT_OPENROUTER_BASE_URL
+      : providerBaseUrl.length > 0
+        ? providerBaseUrl
+        : baseDefault;
+    const apiKey = quickOpenRouter
+      ? quickOpenRouterApiKey || providerApiKey || legacyApiKey
+      : providerApiKey.length > 0
+        ? providerApiKey
+        : legacyApiKey;
+    const model = quickOpenRouter
+      ? quickOpenRouterModel || providerModel || legacyModel
+      : providerModel.length > 0
+        ? providerModel
+        : legacyModel;
+    const modelsPath = quickOpenRouter ? "/models" : providerModelsPath;
+    const chatPath = quickOpenRouter ? "/chat/completions" : providerChatPath;
 
     const headers: Record<string, string> = { ...extraHeaders };
     if (providerPreset === "openrouter") {
-      const siteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
-      const appName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
+      const configuredSiteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
+      const configuredAppName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
+      const siteUrl = quickOpenRouter ? quickOpenRouterSiteUrl || configuredSiteUrl : configuredSiteUrl;
+      const appName = quickOpenRouter ? quickOpenRouterAppName || configuredAppName : configuredAppName;
       if (siteUrl.length > 0) {
         headers["HTTP-Referer"] = siteUrl;
       }
@@ -1155,7 +1476,14 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const providerName = providerPreset === "openrouter" ? "OpenRouter" : providerPreset === "custom" ? "Custom API" : "LM Studio";
+    const providerName =
+      providerPreset === "openrouter"
+        ? quickOpenRouter
+          ? "OpenRouter (Simple)"
+          : "OpenRouter"
+        : providerPreset === "custom"
+          ? "Custom API"
+          : "LM Studio";
 
     return {
       providerPreset,
@@ -1163,9 +1491,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       baseUrl,
       apiKey,
       model,
-      modelsPath: providerModelsPath,
-      chatPath: providerChatPath,
-      headers
+      modelsPath,
+      chatPath,
+      headers,
+      quickOpenRouter
     };
   }
 
@@ -1192,6 +1521,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       agentConfig: {
         workspaceRoot,
         maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 10),
+        executorMaxTokens: cfg.get<number>("executorMaxTokens", 3200),
         maxAskUser: cfg.get<number>("maxAskUser", 0),
         minInvestigationsBeforeExecute: cfg.get<number>("minInvestigationsBeforeExecute", 3),
         strategyCandidates: cfg.get<number>("strategyCandidates", 3),
@@ -1593,6 +1923,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           <button id="planBtn">Plan Only</button>
           <button id="runBtn" class="primary">Run Agent</button>
           <button id="stopBtn" class="warn">Stop</button>
+          <button id="clearSessionBtn">Clear Session</button>
         </div>
       </div>
 
@@ -1652,6 +1983,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const planBtn = document.getElementById("planBtn");
     const runBtn = document.getElementById("runBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const clearSessionBtn = document.getElementById("clearSessionBtn");
     const reloadModelsBtn = document.getElementById("reloadModels");
     const baseUrlInputEl = document.getElementById("baseUrlInput");
     const modelSelectEl = document.getElementById("modelSelect");
@@ -1673,6 +2005,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       mode: "-",
       model: "-"
     };
+    const streamNodes = new Map();
 
     const post = (message) => {
       try {
@@ -1713,6 +2046,33 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       logsEl.appendChild(line);
       while (logsEl.childNodes.length > 500) {
         logsEl.removeChild(logsEl.firstChild);
+      }
+      logsEl.scrollTop = logsEl.scrollHeight;
+    };
+
+    const updateStreamLog = (message) => {
+      if (!logsEl) {
+        return;
+      }
+      const key = String(message.streamId || "default");
+      let line = streamNodes.get(key);
+      if (line && !line.isConnected) {
+        streamNodes.delete(key);
+        line = undefined;
+      }
+      if (!line) {
+        line = document.createElement("div");
+        line.className = "hint mono";
+        line.dataset.streamId = key;
+        logsEl.appendChild(line);
+        streamNodes.set(key, line);
+      }
+
+      const header = "[stream " + (message.stepId || "-") + " t" + String(message.turn || 0) + "] ";
+      line.textContent = header + String(message.text || "");
+      if (message.done) {
+        line.className = "mono";
+        streamNodes.delete(key);
       }
       logsEl.scrollTop = logsEl.scrollHeight;
     };
@@ -1843,6 +2203,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       if (logsEl) {
         logsEl.innerHTML = "";
       }
+      streamNodes.clear();
       if (tokPromptEl) {
         tokPromptEl.textContent = "0";
       }
@@ -1857,6 +2218,46 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       }
       if (statusEl) {
         statusEl.textContent = "Starting...";
+      }
+    };
+
+    const clearSessionUi = () => {
+      if (activityEl) {
+        activityEl.innerHTML = "";
+      }
+      if (logsEl) {
+        logsEl.innerHTML = "";
+      }
+      streamNodes.clear();
+      if (planEl) {
+        planEl.innerHTML = "";
+      }
+      if (stepStatsEl) {
+        stepStatsEl.textContent = "0/0 done";
+      }
+      if (progressBarEl) {
+        progressBarEl.style.width = "0%";
+      }
+      if (tokPromptEl) {
+        tokPromptEl.textContent = "0";
+      }
+      if (tokCompletionEl) {
+        tokCompletionEl.textContent = "0";
+      }
+      if (tokTotalEl) {
+        tokTotalEl.textContent = "0";
+      }
+      if (tokLastEl) {
+        tokLastEl.textContent = "-";
+      }
+      if (promptEl) {
+        promptEl.value = "";
+      }
+      state.mode = "-";
+      state.model = modelSelectEl ? (modelSelectEl.value || "-") : "-";
+      refreshRunMeta();
+      if (statusEl) {
+        statusEl.textContent = "Idle";
       }
     };
 
@@ -2083,6 +2484,16 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    if (clearSessionBtn) {
+      clearSessionBtn.addEventListener("click", () => {
+        if (state.running) {
+          appendLog("Stop current run before clearing session.", "error");
+          return;
+        }
+        post({ type: "clear_session" });
+      });
+    }
+
     if (reloadModelsBtn) {
       reloadModelsBtn.addEventListener("click", () => {
         requestModels();
@@ -2153,6 +2564,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           if (runBtn) {
             runBtn.disabled = disabled;
           }
+          if (clearSessionBtn) {
+            clearSessionBtn.disabled = disabled;
+          }
           if (reloadModelsBtn) {
             reloadModelsBtn.disabled = disabled;
           }
@@ -2220,6 +2634,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           appendActivity(message);
           break;
 
+        case "stream":
+          updateStreamLog(message);
+          break;
+
         case "log":
           appendLog(message.text);
           break;
@@ -2246,6 +2664,11 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           if (statusEl) {
             statusEl.textContent = "Error";
           }
+          break;
+
+        case "session_cleared":
+          clearSessionUi();
+          appendLog("Session cleared. New request will start fresh.");
           break;
 
         default:

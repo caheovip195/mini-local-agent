@@ -8,6 +8,7 @@ const MAX_CACHE_ITEMS = 120;
 const MAX_INLINE_CANDIDATES = 6;
 const COMMENT_WINDOW_LINES = 16;
 const COMMENT_MAX_ITEMS = 10;
+const INLINE_MAX_LINES = 14;
 
 interface CacheValue {
   items: string[];
@@ -47,26 +48,36 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
       }
     }
 
-    const providerPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
+    const providerPresetRaw = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
+    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
+    const providerPreset = quickOpenRouter ? "openrouter" : providerPresetRaw;
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
     const baseDefault = providerPreset === "openrouter" ? "https://openrouter.ai/api/v1" : legacyBaseUrl;
-    const lmBaseUrl = this.normalizeBaseUrl(providerBaseUrl || baseDefault, baseDefault);
+    const lmBaseUrl = this.normalizeBaseUrl(quickOpenRouter ? baseDefault : providerBaseUrl || baseDefault, baseDefault);
 
     const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
     const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
-    const apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+    const quickOpenRouterApiKey = cfg.get<string>("openRouter.apiKey", "").trim();
+    const apiKey = quickOpenRouter ? quickOpenRouterApiKey || providerApiKey || legacyApiKey : providerApiKey || legacyApiKey;
 
     const configuredModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
     const providerModel = cfg.get<string>("provider.model", "").trim();
+    const quickOpenRouterModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim();
     const inlineModel = cfg.get<string>("inline.model", "").trim();
-    const model = inlineModel.length > 0 ? inlineModel : providerModel || configuredModel;
+    const model =
+      inlineModel.length > 0 ? inlineModel : quickOpenRouter ? quickOpenRouterModel || providerModel || configuredModel : providerModel || configuredModel;
     const chatPath = this.normalizeApiPath(cfg.get<string>("provider.chatPath", "/chat/completions"), "/chat/completions");
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
     const headers: Record<string, string> = { ...extraHeaders };
     if (providerPreset === "openrouter") {
-      const siteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
-      const appName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
+      const siteUrl = quickOpenRouter
+        ? cfg.get<string>("openRouter.siteUrl", "").trim() || cfg.get<string>("provider.openRouterSiteUrl", "").trim()
+        : cfg.get<string>("provider.openRouterSiteUrl", "").trim();
+      const appName = quickOpenRouter
+        ? cfg.get<string>("openRouter.appName", "Local Agent Coder").trim() ||
+          cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim()
+        : cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
       if (siteUrl.length > 0) {
         headers["HTTP-Referer"] = siteUrl;
       }
@@ -76,13 +87,19 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
     const maxTokens = Math.min(Math.max(cfg.get<number>("inline.maxTokens", 160), 32), 400);
     const maxContextChars = Math.min(Math.max(cfg.get<number>("inline.maxContextChars", 6000), 1200), 20000);
-    const maxSuggestionChars = Math.min(Math.max(cfg.get<number>("inline.maxSuggestionChars", 800), 80), 4000);
+    const maxSuggestionChars = Math.min(Math.max(cfg.get<number>("inline.maxSuggestionChars", 420), 80), 4000);
     const maxCandidates = Math.min(Math.max(cfg.get<number>("inline.maxCandidates", 3), 1), MAX_INLINE_CANDIDATES);
     const verboseLog = cfg.get<boolean>("inline.verboseLog", false);
+    if (providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(apiKey)) {
+      if (verboseLog) {
+        this.output.appendLine("inline suggest skipped: missing OpenRouter API key.");
+      }
+      return [];
+    }
 
     const before = this.collectBeforeContext(document, position, maxContextChars);
     const after = this.collectAfterContext(document, position, Math.floor(maxContextChars / 2));
-    const fileContext = this.collectWholeFileContext(document, maxContextChars);
+    const fileContext = this.collectWholeFileContext(document, Math.min(maxContextChars, 3200));
     const nearbyComments = this.collectNearbyComments(document, position, COMMENT_WINDOW_LINES, COMMENT_MAX_ITEMS);
     const nearbyFunctions = this.collectFunctionCandidates(document, 20);
     const cursorLine = position.line + 1;
@@ -104,7 +121,13 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
 
     const client = new LmStudioClient({
       providerName:
-        providerPreset === "openrouter" ? "OpenRouter" : providerPreset === "custom" ? "Custom API" : "LM Studio",
+        providerPreset === "openrouter"
+          ? quickOpenRouter
+            ? "OpenRouter (Simple)"
+            : "OpenRouter"
+          : providerPreset === "custom"
+            ? "Custom API"
+            : "LM Studio",
       baseUrl: lmBaseUrl,
       apiKey,
       model,
@@ -126,6 +149,9 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
           "}",
           "Return 1-6 candidates based on intent from cursor and nearby comments.",
           "Each candidate.text is direct insertion text at cursor.",
+          "Return code only. Do not include metadata labels, prose, or prompt echoes.",
+          "Do not output lines like File path, Language, Cursor line, Current line prefix/suffix, Nearby comments.",
+          "If current line is a comment describing intent, generate the code implementation directly below that comment.",
           "Do not include markdown, explanations, or code fences in text.",
           "Respect existing file structure, naming conventions, and local coding style.",
           "Prefer function-level completions when nearby comments imply planned function behavior.",
@@ -249,7 +275,15 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
 
     if (candidates.length === 0) {
-      candidates.push(raw);
+      const blocks = [...raw.matchAll(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)```/g)].map((m) => m[1]).filter(Boolean);
+      if (blocks.length > 0) {
+        candidates.push(...blocks);
+      } else {
+        const direct = raw.trim();
+        if (this.looksLikeCode(direct) && !this.looksLikePromptEcho(direct)) {
+          candidates.push(direct);
+        }
+      }
     }
 
     const normalized: string[] = [];
@@ -287,6 +321,10 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
 
     text = text.replace(/^Here(?:'s| is).*\n/i, "");
+    text = this.stripPromptEchoLines(text);
+    if (this.looksLikePromptEcho(text)) {
+      return "";
+    }
     text = text.replace(/^\s*[-*]\s+/gm, "");
     text = text.replace(/^\d+\.\s+/gm, "");
 
@@ -303,11 +341,67 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
       return "";
     }
 
+    const lines = text.split("\n");
+    if (lines.length > INLINE_MAX_LINES) {
+      text = lines.slice(0, INLINE_MAX_LINES).join("\n");
+    }
+
     if (text.length > maxSuggestionChars) {
       text = text.slice(0, maxSuggestionChars);
     }
 
+    if (!this.looksLikeCode(text) || this.looksLikePromptEcho(text)) {
+      return "";
+    }
+
     return text;
+  }
+
+  private stripPromptEchoLines(value: string): string {
+    const blockedLine = /^(file path|language|cursor line|cursor column|current line prefix|current line suffix|nearby user comments|existing function candidates|code before cursor|code after cursor|current file content snapshot|return up to)\s*:/i;
+    const cleaned = value
+      .split("\n")
+      .filter((line) => !blockedLine.test(line.trim()))
+      .join("\n")
+      .trim();
+    return cleaned;
+  }
+
+  private looksLikePromptEcho(value: string): boolean {
+    const lower = value.toLowerCase();
+    const markers = [
+      "file path:",
+      "language:",
+      "cursor line:",
+      "cursor column:",
+      "current line prefix:",
+      "current line suffix:",
+      "nearby user comments around cursor:",
+      "existing function candidates in file:",
+      "code before cursor",
+      "code after cursor",
+      "current file content snapshot:"
+    ];
+    return markers.some((marker) => lower.includes(marker));
+  }
+
+  private looksLikeCode(value: string): boolean {
+    const text = value.trim();
+    if (!text) {
+      return false;
+    }
+    if (this.looksLikePromptEcho(text)) {
+      return false;
+    }
+
+    const codeSignals = [
+      /[{}()[\];]/,
+      /=>/,
+      /\b(final|var|const|if|for|while|switch|return|await|try|catch|class|void|Future|List<|Map<|import)\b/,
+      /^\s*[A-Za-z_]\w*\s*\([^)]*\)\s*(=>|\{)/m,
+      /^\s*\.\w+\(/m
+    ];
+    return codeSignals.some((pattern) => pattern.test(text));
   }
 
   private collectWholeFileContext(document: vscode.TextDocument, maxChars: number): string {
@@ -368,18 +462,26 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     const seen = new Set<string>();
     const bannedPrefixes = ["if", "for", "while", "switch", "catch", "return"];
 
-    for (const line of lines) {
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
       const trimmed = line.trim();
       if (!trimmed || trimmed.length > 220) {
         continue;
       }
 
+      const nextTrimmed = index + 1 < lines.length ? lines[index + 1].trim() : "";
+      if (trimmed.endsWith(";") && !trimmed.includes("=>")) {
+        continue;
+      }
+
       const looksFunctionLike =
         /^function\s+[A-Za-z_]\w*\s*\(/.test(trimmed) ||
-        /^(const|let|var)\s+[A-Za-z_]\w*\s*=\s*(async\s*)?\(/.test(trimmed) ||
-        /^\s*(public|private|protected)?\s*(async\s+)?[A-Za-z_]\w*\s*\([^)]*\)\s*\{?/.test(trimmed) ||
-        /^def\s+[A-Za-z_]\w*\s*\(/.test(trimmed) ||
-        /^func\s+[A-Za-z_]\w*\s*\(/.test(trimmed);
+        /^(const|let|var)\s+[A-Za-z_]\w*\s*=\s*(async\s*)?\([^)]*\)\s*=>/.test(trimmed) ||
+        /^(?:[A-Za-z_<>\[\]?,\s]+\s+)?[A-Za-z_]\w*\s*\([^;{}]*\)\s*(?:async\s*)?(?:\{|=>)$/.test(trimmed) ||
+        (/^(?:[A-Za-z_<>\[\]?,\s]+\s+)?[A-Za-z_]\w*\s*\([^;{}]*\)\s*(?:async\s*)?$/.test(trimmed) &&
+          nextTrimmed === "{") ||
+        /^def\s+[A-Za-z_]\w*\s*\([^)]*\)\s*:/.test(trimmed) ||
+        /^func\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(\{|=>)?/.test(trimmed);
 
       if (!looksFunctionLike) {
         continue;
@@ -543,6 +645,15 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     } catch {
       return {};
     }
+  }
+
+  private isMissingOpenRouterApiKey(value: string): boolean {
+    const key = value.trim();
+    if (!key) {
+      return true;
+    }
+    const placeholder = new Set(["lm-studio", "your-openrouter-key", "changeme", "none"]);
+    return placeholder.has(key.toLowerCase());
   }
 
   private sanitizeBaseUrlToken(value: string): string {

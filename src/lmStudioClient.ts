@@ -19,6 +19,8 @@ interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
   model?: string;
+  stream?: boolean;
+  onDelta?: (delta: string) => void;
 }
 
 export interface TokenUsage {
@@ -126,41 +128,23 @@ export class LmStudioClient {
   ): Promise<ChatResult> {
     let lastError: Error | undefined;
     const requestedModel = options?.model?.trim() || this.model;
+    const streamRequested = options?.stream === true;
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const response = await fetch(this.joinUrl(this.chatPath), {
-          method: "POST",
-          headers: this.buildHeaders(true),
-          body: JSON.stringify({
-            model: requestedModel,
-            messages,
-            temperature: options?.temperature ?? 0.15,
-            max_tokens: options?.maxTokens ?? 1200,
-            stream: false
-          }),
-          signal
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`${this.providerName} error ${response.status}: ${errorText}`);
+        if (streamRequested) {
+          try {
+            return await this.chatStream(messages, requestedModel, signal, options);
+          } catch (streamError) {
+            const streamEmitted = (streamError as { streamEmitted?: boolean }).streamEmitted === true;
+            if (!streamEmitted) {
+              return await this.chatJson(messages, requestedModel, signal, options);
+            }
+            throw streamError;
+          }
         }
 
-        const data = (await response.json()) as ChatCompletionResponse;
-        const content = this.extractCompletionContent(data);
-        if (!content) {
-          throw new Error("LM Studio returned empty completion payload.");
-        }
-
-        const responseModel =
-          typeof data.model === "string" && data.model.trim().length > 0 ? data.model : requestedModel;
-
-        return {
-          content,
-          usage: this.extractUsage(data),
-          model: responseModel
-        };
+        return await this.chatJson(messages, requestedModel, signal, options);
       } catch (error) {
         if (signal?.aborted) {
           throw new Error(`${this.providerName} request cancelled.`);
@@ -176,6 +160,239 @@ export class LmStudioClient {
     }
 
     throw lastError ?? new Error(`${this.providerName} request failed.`);
+  }
+
+  private async chatJson(
+    messages: ChatMessage[],
+    requestedModel: string,
+    signal: AbortSignal | undefined,
+    options?: ChatOptions
+  ): Promise<ChatResult> {
+    const response = await fetch(this.joinUrl(this.chatPath), {
+      method: "POST",
+      headers: this.buildHeaders(true),
+      body: JSON.stringify({
+        model: requestedModel,
+        messages,
+        temperature: options?.temperature ?? 0.15,
+        max_tokens: options?.maxTokens ?? 1200,
+        stream: false
+      }),
+      signal
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`${this.providerName} error ${response.status}: ${errorText}`);
+    }
+
+    const data = (await response.json()) as ChatCompletionResponse;
+    const content = this.extractCompletionContent(data);
+    if (!content) {
+      throw new Error("LM Studio returned empty completion payload.");
+    }
+
+    const responseModel = typeof data.model === "string" && data.model.trim().length > 0 ? data.model : requestedModel;
+    return {
+      content,
+      usage: this.extractUsage(data),
+      model: responseModel
+    };
+  }
+
+  private async chatStream(
+    messages: ChatMessage[],
+    requestedModel: string,
+    signal: AbortSignal | undefined,
+    options?: ChatOptions
+  ): Promise<ChatResult> {
+    let emittedAny = false;
+
+    try {
+      const response = await fetch(this.joinUrl(this.chatPath), {
+        method: "POST",
+        headers: this.buildHeaders(true),
+        body: JSON.stringify({
+          model: requestedModel,
+          messages,
+          temperature: options?.temperature ?? 0.15,
+          max_tokens: options?.maxTokens ?? 1200,
+          stream: true
+        }),
+        signal
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`${this.providerName} error ${response.status}: ${errorText}`);
+      }
+
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      if (contentType.includes("application/json")) {
+        const data = (await response.json()) as ChatCompletionResponse;
+        const content = this.extractCompletionContent(data);
+        if (!content) {
+          throw new Error(`${this.providerName} stream response was empty.`);
+        }
+        return {
+          content,
+          usage: this.extractUsage(data),
+          model: typeof data.model === "string" && data.model.trim().length > 0 ? data.model : requestedModel
+        };
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error(`${this.providerName} stream body is unavailable.`);
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assembled = "";
+      let responseModel = requestedModel;
+      let usage: TokenUsage | undefined;
+
+      const processEventBlock = (block: string): void => {
+        const lines = block.split("\n");
+        const dataParts: string[] = [];
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) {
+            continue;
+          }
+          dataParts.push(line.slice(5).trimStart());
+        }
+        if (dataParts.length === 0) {
+          return;
+        }
+
+        const payloadText = dataParts.join("\n").trim();
+        if (!payloadText || payloadText === "[DONE]") {
+          return;
+        }
+
+        let payload: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(payloadText) as unknown;
+          if (!parsed || typeof parsed !== "object") {
+            return;
+          }
+          payload = parsed as Record<string, unknown>;
+        } catch {
+          return;
+        }
+
+        if (typeof payload.model === "string" && payload.model.trim().length > 0) {
+          responseModel = payload.model;
+        }
+
+        const parsedUsage = this.extractUsage(payload as unknown as ChatCompletionResponse);
+        if (parsedUsage) {
+          usage = parsedUsage;
+        }
+
+        const delta = this.extractStreamDeltaContent(payload);
+        if (!delta) {
+          return;
+        }
+
+        assembled += delta;
+        emittedAny = true;
+        try {
+          options?.onDelta?.(delta);
+        } catch {
+          // Ignore stream callback failures to keep generation alive.
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (!value) {
+          continue;
+        }
+
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        while (true) {
+          const boundaryIndex = buffer.indexOf("\n\n");
+          if (boundaryIndex < 0) {
+            break;
+          }
+          const eventBlock = buffer.slice(0, boundaryIndex);
+          buffer = buffer.slice(boundaryIndex + 2);
+          processEventBlock(eventBlock);
+        }
+      }
+
+      buffer += decoder.decode();
+      if (buffer.trim().length > 0) {
+        processEventBlock(buffer.replace(/\r\n/g, "\n"));
+      }
+
+      const content = assembled.trim();
+      if (!content) {
+        throw new Error(`${this.providerName} stream returned no content.`);
+      }
+
+      return {
+        content,
+        usage,
+        model: responseModel
+      };
+    } catch (error) {
+      const wrapped = error instanceof Error ? error : new Error(String(error));
+      (wrapped as { streamEmitted?: boolean }).streamEmitted = emittedAny;
+      throw wrapped;
+    }
+  }
+
+  private extractStreamDeltaContent(payload: Record<string, unknown>): string {
+    const choicesRaw = payload.choices;
+    if (Array.isArray(choicesRaw) && choicesRaw.length > 0) {
+      const firstChoice = choicesRaw[0];
+      if (firstChoice && typeof firstChoice === "object") {
+        const choice = firstChoice as Record<string, unknown>;
+        const deltaRaw = choice.delta;
+        if (deltaRaw && typeof deltaRaw === "object") {
+          const delta = deltaRaw as Record<string, unknown>;
+          if (typeof delta.content === "string") {
+            return delta.content;
+          }
+          if (Array.isArray(delta.content)) {
+            const joined = delta.content
+              .filter((part): part is Record<string, unknown> => Boolean(part) && typeof part === "object")
+              .map((part) => this.partToText(part))
+              .join("");
+            if (joined.trim().length > 0) {
+              return joined;
+            }
+          }
+          if (typeof delta.text === "string") {
+            return delta.text;
+          }
+        }
+
+        const messageRaw = choice.message;
+        if (messageRaw && typeof messageRaw === "object") {
+          const messageText = this.extractMessageContent(messageRaw as ChatCompletionMessage);
+          if (messageText) {
+            return messageText;
+          }
+        }
+
+        if (typeof choice.text === "string") {
+          return choice.text;
+        }
+      }
+    }
+
+    if (typeof payload.output_text === "string") {
+      return payload.output_text;
+    }
+
+    return "";
   }
 
   private extractCompletionContent(data: ChatCompletionResponse): string | undefined {

@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.13",
+  "version": "0.0.22",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -14,7 +14,8 @@
     "onStartupFinished",
     "onView:localAgent.chatView",
     "onCommand:localAgent.runTask",
-    "onCommand:localAgent.planTask"
+    "onCommand:localAgent.planTask",
+    "onCommand:localAgent.setupOpenRouterSimple"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -44,6 +45,10 @@
       {
         "command": "localAgent.planTask",
         "title": "Local Agent: Create Plan Only"
+      },
+      {
+        "command": "localAgent.setupOpenRouterSimple",
+        "title": "Local Agent: Setup OpenRouter (Simple)"
       }
     ],
     "configuration": {
@@ -63,6 +68,31 @@
           "type": "string",
           "default": "qwen2.5-coder-7b-instruct",
           "description": "Model name loaded in LM Studio."
+        },
+        "localAgent.openRouter.simpleMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable simple OpenRouter config (only API key + model). When enabled, provider is forced to OpenRouter."
+        },
+        "localAgent.openRouter.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter API key for simple mode."
+        },
+        "localAgent.openRouter.model": {
+          "type": "string",
+          "default": "openrouter/auto",
+          "description": "OpenRouter model for simple mode."
+        },
+        "localAgent.openRouter.siteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional HTTP-Referer for OpenRouter simple mode."
+        },
+        "localAgent.openRouter.appName": {
+          "type": "string",
+          "default": "Local Agent Coder",
+          "description": "Optional X-Title for OpenRouter simple mode."
         },
         "localAgent.provider.preset": {
           "type": "string",
@@ -147,7 +177,7 @@
         },
         "localAgent.inline.maxSuggestionChars": {
           "type": "number",
-          "default": 800,
+          "default": 420,
           "minimum": 80,
           "maximum": 4000,
           "description": "Maximum characters returned for one inline suggestion."
@@ -177,6 +207,13 @@
           "minimum": 3,
           "maximum": 30,
           "description": "Maximum agent turns per plan step."
+        },
+        "localAgent.executorMaxTokens": {
+          "type": "number",
+          "default": 3200,
+          "minimum": 600,
+          "maximum": 8000,
+          "description": "Max completion tokens for each executor turn. Increase if write_file JSON gets truncated."
         },
         "localAgent.maxAskUser": {
           "type": "number",

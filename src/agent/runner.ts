@@ -19,11 +19,46 @@ import type {
 
 const execAsync = promisify(execCallback);
 const execFileAsync = promisify(execFileCallback);
-const SEARCH_EXCLUDE = "**/{node_modules,.git,dist,build,.next,.dart_tool,coverage,target}/**";
+const SEARCH_EXCLUDE =
+  "**/{node_modules,.git,dist,build,.next,.dart_tool,coverage,target,vendor,Pods,.gradle,.turbo,.cache,.fvm,.pub-cache,.symlinks}/**";
+const RG_SEARCH_EXCLUDE_GLOBS = [
+  "!**/.git/**",
+  "!**/node_modules/**",
+  "!**/dist/**",
+  "!**/build/**",
+  "!**/.next/**",
+  "!**/.dart_tool/**",
+  "!**/coverage/**",
+  "!**/target/**",
+  "!**/vendor/**",
+  "!**/.gradle/**",
+  "!**/Pods/**",
+  "!**/.turbo/**",
+  "!**/.cache/**",
+  "!**/.fvm/**",
+  "!**/.pub-cache/**",
+  "!**/.symlinks/**",
+  "!**/ios/Flutter/**",
+  "!**/ios/Pods/**",
+  "!**/android/.gradle/**",
+  "!**/android/.cxx/**",
+  "!**/android/build/**",
+  "!**/macos/Flutter/**",
+  "!**/linux/flutter/**",
+  "!**/windows/flutter/**"
+];
+const SOURCE_FIRST_ROOTS = ["lib", "src", "app", "test", "integration_test", "packages"];
+const TEST_FIRST_ROOTS = ["integration_test", "test", "lib", "src", "app", "packages"];
 const STEP_HISTORY_TAIL_MESSAGES = 10;
 const MAX_PARSE_ERROR_STREAK_BEFORE_RECOVERY = 2;
 const MAX_REPEATED_ACTION_BLOCKS_BEFORE_RECOVERY = 2;
 const NO_PROGRESS_WARNING_THRESHOLD = 3;
+const MAX_EXTRA_INVESTIGATION_ACTIONS = 3;
+const TURN_EXTENSION_CHUNK = 4;
+const MAX_TURN_EXTENSION_TOTAL = 18;
+const MAX_WRITE_FILE_CONTENT_CHARS = 4200;
+const MAX_APPEND_FILE_CHUNK_CHARS = 2200;
+const MAX_PATCH_REPLACE_CHARS = 3200;
 const ASK_USER_MIN_INVESTIGATIONS = 4;
 const WORKSPACE_INDEX_LIMIT = 4000;
 const SNAPSHOT_HEAD_PREVIEW = 220;
@@ -57,13 +92,32 @@ interface WorkspaceSnapshotOptions {
 
 const PLANNER_SNAPSHOT_OPTIONS: WorkspaceSnapshotOptions = {
   fileLimit: 2500,
-  keyFiles: ["README.md", "package.json", "tsconfig.json", "pyproject.toml", "go.mod"],
+  keyFiles: [
+    "README.md",
+    "package.json",
+    "tsconfig.json",
+    "pubspec.yaml",
+    "analysis_options.yaml",
+    "pyproject.toml",
+    "pytest.ini",
+    "go.mod",
+    "Cargo.toml"
+  ],
   keyFileCharLimit: 1200
 };
 
 const EXECUTOR_SNAPSHOT_OPTIONS: WorkspaceSnapshotOptions = {
   fileLimit: 2500,
-  keyFiles: ["README.md", "package.json", "tsconfig.json", "src/extension.ts", "src/index.ts"],
+  keyFiles: [
+    "README.md",
+    "package.json",
+    "tsconfig.json",
+    "pubspec.yaml",
+    "analysis_options.yaml",
+    "pytest.ini",
+    "src/extension.ts",
+    "src/index.ts"
+  ],
   keyFileCharLimit: 700
 };
 
@@ -76,6 +130,7 @@ export class LocalAgentRunner {
   private selectedStrategyBrief = "Use minimal-change implementation aligned with existing project structure.";
   private verificationAttempted = false;
   private currentTaskScope?: TaskScopeProfile;
+  private totalInvestigationActions = 0;
 
   constructor(
     private readonly client: LmStudioClient,
@@ -140,6 +195,7 @@ export class LocalAgentRunner {
 
   async run(task: string, signal?: AbortSignal): Promise<void> {
     this.verificationAttempted = false;
+    this.totalInvestigationActions = 0;
     const plan = await this.createPlan(task, signal);
 
     this.callbacks.onStatus("Preparing execution context...");
@@ -184,7 +240,10 @@ export class LocalAgentRunner {
       failedSteps.length > 0
         ? `Failed steps (${failedSteps.length}): ${failedSteps.map((step) => `${step.id} (${step.error})`).join("; ")}`
         : "Failed steps: 0.",
-      changed.length > 0 ? `Changed files (${changed.length}): ${changed.join(", ")}` : "No files changed."
+      changed.length > 0 ? `Changed files (${changed.length}): ${changed.join(", ")}` : "No files changed.",
+      changed.length > 0 && !this.verificationAttempted
+        ? "Verification warning: no test/lint/typecheck/build command was attempted."
+        : "Verification: attempted."
     ].join("\n");
 
     this.callbacks.onDone(summary);
@@ -197,7 +256,8 @@ export class LocalAgentRunner {
     signal?: AbortSignal
   ): Promise<StepResult> {
     const workspaceContext = await this.getExecutorWorkspaceSnapshot();
-    const minInvestigations = Math.max(1, this.config.minInvestigationsBeforeExecute);
+    const minInvestigations = this.computeRequiredInvestigationsForStep();
+    const maxInvestigations = Math.max(minInvestigations + MAX_EXTRA_INVESTIGATION_ACTIONS, minInvestigations * 2);
 
     const stepMessages: ChatMessage[] = [
       {
@@ -232,19 +292,92 @@ export class LocalAgentRunner {
     let repeatedCount = 0;
     let repeatedActionBlocks = 0;
     let turnsWithoutProgress = 0;
+    let stepTurnLimit = Math.max(3, this.config.maxTurnsPerStep);
+    const stepTurnHardLimit = Math.max(stepTurnLimit, stepTurnLimit + MAX_TURN_EXTENSION_TOTAL);
+    const changedFilesAtStepStart = this.changedFiles.size;
+    let lastExecutionProgressTurn = 0;
+    let executionProgressCount = 0;
+    let extensionCount = 0;
 
-    for (let turn = 1; turn <= this.config.maxTurnsPerStep; turn += 1) {
+    for (let turn = 1; turn <= stepTurnLimit; turn += 1) {
       if (signal?.aborted) {
         throw new Error("Run cancelled.");
       }
 
-      this.compactStepMessages(stepMessages);
-      this.callbacks.onStatus(`Step ${step.id} turn ${turn}/${this.config.maxTurnsPerStep}`);
+      if (turn === stepTurnLimit && stepTurnLimit < stepTurnHardLimit) {
+        const changedInThisStep = this.changedFiles.size > changedFilesAtStepStart;
+        const recentExecutionProgress =
+          lastExecutionProgressTurn > 0 && turn - lastExecutionProgressTurn <= 3;
+        const shouldExtend =
+          turnsWithoutProgress <= 2 &&
+          (recentExecutionProgress || changedInThisStep || executionProgressCount >= 2);
 
-      const stepResponse = await this.client.chat(stepMessages, signal, {
-        temperature: 0.1,
-        maxTokens: 1200
-      });
+        if (shouldExtend) {
+          const extension = Math.min(TURN_EXTENSION_CHUNK, stepTurnHardLimit - stepTurnLimit);
+          if (extension > 0) {
+            stepTurnLimit += extension;
+            extensionCount += 1;
+            this.callbacks.onLog(
+              `TurnBudgetGuard: extending ${step.id} by ${extension} turn(s) (new limit ${stepTurnLimit}/${stepTurnHardLimit}) due to ongoing execution progress.`
+            );
+          }
+        }
+      }
+
+      this.compactStepMessages(stepMessages);
+      this.callbacks.onStatus(`Step ${step.id} turn ${turn}/${stepTurnLimit}`);
+
+      const streamId = `${step.id}:turn${turn}`;
+      let streamedText = "";
+      let pendingStreamChars = 0;
+      let lastStreamEmitMs = 0;
+      const emitStream = (done: boolean): void => {
+        if (!this.callbacks.onStream) {
+          return;
+        }
+        const preview = this.toStreamPreview(streamedText);
+        if (!done && preview.length === 0) {
+          return;
+        }
+        this.callbacks.onStream({
+          phase: "executor",
+          stepId: step.id,
+          turn,
+          streamId,
+          text: preview,
+          done
+        });
+      };
+
+      let stepResponse;
+      try {
+        stepResponse = await this.client.chat(stepMessages, signal, {
+          temperature: 0.1,
+          maxTokens: this.getExecutorMaxTokens(),
+          stream: true,
+          onDelta: (delta) => {
+            if (!delta) {
+              return;
+            }
+            streamedText += delta;
+            pendingStreamChars += delta.length;
+            const now = Date.now();
+            if (pendingStreamChars >= 70 || now - lastStreamEmitMs >= 180) {
+              emitStream(false);
+              pendingStreamChars = 0;
+              lastStreamEmitMs = now;
+            }
+          }
+        });
+      } catch (error) {
+        if (streamedText.length > 0) {
+          emitStream(true);
+        }
+        throw error;
+      }
+      if (streamedText.length > 0) {
+        emitStream(true);
+      }
       const rawResponse = stepResponse.content;
       if (stepResponse.usage) {
         this.callbacks.onUsage?.({
@@ -266,7 +399,9 @@ export class LocalAgentRunner {
         decision = this.parseDecision(rawResponse);
       } catch (error) {
         parseErrorStreak += 1;
-        this.callbacks.onLog(`Decision parse error (${parseErrorStreak}): ${(error as Error).message}`);
+        const parseErrorMessage = (error as Error).message;
+        this.callbacks.onLog(`Decision parse error (${parseErrorStreak}): ${parseErrorMessage}`);
+        const likelyTruncatedWritePayload = this.isLikelyTruncatedWritePayload(rawResponse, parseErrorMessage);
 
         if (parseErrorStreak >= MAX_PARSE_ERROR_STREAK_BEFORE_RECOVERY) {
           const recoveryAction = await this.buildRecoveryAction(step, investigationCount);
@@ -288,8 +423,9 @@ export class LocalAgentRunner {
         } else {
           stepMessages.push({
             role: "user",
-            content:
-              "Output was not valid JSON for the required schema. Return STRICT JSON only with one action object."
+            content: likelyTruncatedWritePayload
+              ? "Previous output appears to be truncated write_file JSON. Retry STRICT JSON with one action object only. Use patch_file/append_file or content_lines with smaller chunks."
+              : "Output was not valid JSON for the required schema. Return STRICT JSON only with one action object."
           });
         }
 
@@ -390,6 +526,25 @@ export class LocalAgentRunner {
         }
       }
 
+      if (this.isInvestigationAction(actionType) && investigationCount >= maxInvestigations) {
+        const guardMessage = [
+          "ExplorationGuard: investigation budget reached for this step.",
+          `Investigations done: ${investigationCount}/${maxInvestigations}.`,
+          "Stop searching and execute using current evidence with write_file, run_command, or complete_step."
+        ].join(" ");
+        this.callbacks.onLog(guardMessage);
+        this.callbacks.onAction?.({
+          stepId: step.id,
+          turn,
+          actionType,
+          status: "blocked",
+          detail: guardMessage
+        });
+        stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
+        turnsWithoutProgress += 1;
+        continue;
+      }
+
       if (this.requiresInvestigation(actionType) && investigationCount < minInvestigations) {
         const guardMessage = this.buildInvestigationGuardMessage(
           actionType,
@@ -411,6 +566,7 @@ export class LocalAgentRunner {
 
       if (this.isInvestigationAction(actionType)) {
         investigationCount += 1;
+        this.totalInvestigationActions += 1;
       }
 
       const actionResult = await this.executeAction(decision.action, investigationCount);
@@ -430,6 +586,10 @@ export class LocalAgentRunner {
       }
 
       turnsWithoutProgress = actionResult.progress ? 0 : turnsWithoutProgress + 1;
+      if (actionResult.progress && this.isExecutionAction(actionType)) {
+        lastExecutionProgressTurn = turn;
+        executionProgressCount += 1;
+      }
       const noProgressNote =
         turnsWithoutProgress >= NO_PROGRESS_WARNING_THRESHOLD
           ? "\nNoProgressGuard: avoid blocked actions; inspect files or search code with a new query."
@@ -442,7 +602,7 @@ export class LocalAgentRunner {
     }
 
     throw new Error(
-      `Step ${step.id} exceeded max turns (${this.config.maxTurnsPerStep}). Agent may be looping.`
+      `Step ${step.id} exceeded max turns (${stepTurnLimit}${extensionCount > 0 ? `, extended ${extensionCount} time(s)` : ""}). Agent may be looping.`
     );
   }
 
@@ -459,6 +619,7 @@ export class LocalAgentRunner {
     let nextInvestigationCount = investigationCount;
     if (this.isInvestigationAction(actionType)) {
       nextInvestigationCount += 1;
+      this.totalInvestigationActions += 1;
     }
 
     this.callbacks.onLog(`${reason}: auto action ${JSON.stringify(action)}`);
@@ -504,6 +665,14 @@ export class LocalAgentRunner {
       case "list_files": {
         const pattern = toStringValue(action.pattern, "**/*");
         const limit = Math.min(Math.max(toNumberValue(action.limit, 500), 1), 3000);
+        const patternBlock = this.evaluateListPatternGuard(pattern);
+        if (patternBlock) {
+          return {
+            kind: "tool",
+            message: patternBlock,
+            progress: false
+          };
+        }
 
         try {
           const files = await this.listFiles(pattern, limit);
@@ -532,6 +701,14 @@ export class LocalAgentRunner {
           const endLineRaw = toNumberValue(action.endLine, Number.MAX_SAFE_INTEGER);
           const absPath = this.resolveWorkspacePath(filePath);
           const relPath = this.toRelative(absPath);
+          const pathGuard = this.evaluatePathAccessGuard(relPath, "read");
+          if (pathGuard) {
+            return {
+              kind: "tool",
+              message: pathGuard,
+              progress: false
+            };
+          }
           const content = await fs.readFile(absPath, "utf8");
           const lines = content.split(/\r?\n/g);
           const startLine = Math.max(1, Math.floor(startLineRaw));
@@ -598,62 +775,114 @@ export class LocalAgentRunner {
         }
 
         const filePath = toStringValue(action.path);
-        const content = toStringValue(action.content);
+        const content = this.resolveWriteContent(action);
         if (!filePath) {
           return { kind: "tool", message: "write_file failed: missing path.", progress: false };
         }
-
-        try {
-          const absPath = this.resolveWorkspacePath(filePath);
-          const relPath = this.toRelative(absPath);
-          const existsBeforeWrite = await this.fileExists(absPath);
-          const writeScopeBlock = this.evaluateWriteScopeGuard(relPath, existsBeforeWrite);
-          if (writeScopeBlock) {
-            return {
-              kind: "tool",
-              message: writeScopeBlock,
-              progress: false
-            };
-          }
-
-          if (!existsBeforeWrite) {
-            const duplicateCandidates = await this.findLikelyDuplicateFiles(relPath);
-            const allowDuplicate = action.allowDuplicate === true;
-            if (!allowDuplicate && duplicateCandidates.length > 0) {
-              return {
-                kind: "tool",
-                message: [
-                  `DuplicateGuard: creating '${relPath}' may duplicate existing files.`,
-                  `Potential duplicates: ${duplicateCandidates.join(", ")}`,
-                  "If this is truly a separate file, set allowDuplicate=true. Otherwise edit existing file."
-                ].join(" "),
-                progress: false
-              };
-            }
-          }
-
-          await fs.mkdir(path.dirname(absPath), { recursive: true });
-          await fs.writeFile(absPath, content, "utf8");
-
-          this.changedFiles.add(relPath);
-          this.executorSnapshotCache = undefined;
-          if (this.workspaceFileIndexCache && !this.workspaceFileIndexCache.includes(relPath)) {
-            this.workspaceFileIndexCache.push(relPath);
-            this.workspaceFileIndexCache.sort((a, b) => a.localeCompare(b));
-          }
-
+        if (typeof content !== "string") {
           return {
             kind: "tool",
-            message: `${existsBeforeWrite ? "Updated" : "Created"} ${relPath} (${content.length} chars).`,
-            progress: true
-          };
-        } catch (error) {
-          return {
-            kind: "tool",
-            message: `write_file failed for ${filePath}: ${(error as Error).message}`,
+            message:
+              "write_file failed: missing content. Provide one of content (string), content_lines (string[]), or contentBase64.",
             progress: false
           };
         }
+        if (content.length > MAX_WRITE_FILE_CONTENT_CHARS) {
+          return {
+            kind: "tool",
+            message: [
+              `write_file blocked: payload too large (${content.length} chars).`,
+              `Use patch_file/append_file or split content into chunks <= ${MAX_WRITE_FILE_CONTENT_CHARS} chars.`
+            ].join(" "),
+            progress: false
+          };
+        }
+
+        return this.applyWriteFile(filePath, content, {
+          mode: "overwrite",
+          allowCreate: true,
+          allowDuplicate: action.allowDuplicate === true
+        });
+      }
+
+      case "append_file": {
+        if (!this.config.autoApplyWrites) {
+          return {
+            kind: "tool",
+            message: "append_file blocked by config (localAgent.autoApplyWrites=false).",
+            progress: false
+          };
+        }
+
+        const filePath = toStringValue(action.path);
+        const content = this.resolveWriteContent(action);
+        const allowCreate = action.allowCreate === true || action.createIfMissing === true;
+        if (!filePath) {
+          return { kind: "tool", message: "append_file failed: missing path.", progress: false };
+        }
+        if (typeof content !== "string" || content.length === 0) {
+          return {
+            kind: "tool",
+            message:
+              "append_file failed: missing content. Provide content/content_lines/contentBase64 with non-empty chunk.",
+            progress: false
+          };
+        }
+        if (content.length > MAX_APPEND_FILE_CHUNK_CHARS) {
+          return {
+            kind: "tool",
+            message: [
+              `append_file blocked: chunk too large (${content.length} chars).`,
+              `Append in smaller chunks <= ${MAX_APPEND_FILE_CHUNK_CHARS} chars.`
+            ].join(" "),
+            progress: false
+          };
+        }
+        return this.applyWriteFile(filePath, content, {
+          mode: "append",
+          allowCreate,
+          allowDuplicate: false
+        });
+      }
+
+      case "patch_file": {
+        if (!this.config.autoApplyWrites) {
+          return {
+            kind: "tool",
+            message: "patch_file blocked by config (localAgent.autoApplyWrites=false).",
+            progress: false
+          };
+        }
+
+        const filePath = toStringValue(action.path);
+        const findText = toStringValue(action.find);
+        const replaceText = this.resolvePatchReplaceText(action);
+        const replaceAll = action.all === true || action.replaceAll === true;
+        if (!filePath) {
+          return { kind: "tool", message: "patch_file failed: missing path.", progress: false };
+        }
+        if (!findText) {
+          return { kind: "tool", message: "patch_file failed: missing find text.", progress: false };
+        }
+        if (typeof replaceText !== "string") {
+          return {
+            kind: "tool",
+            message:
+              "patch_file failed: missing replace content. Provide replace/replacement/replace_lines/replaceBase64.",
+            progress: false
+          };
+        }
+        if (replaceText.length > MAX_PATCH_REPLACE_CHARS) {
+          return {
+            kind: "tool",
+            message: [
+              `patch_file blocked: replacement too large (${replaceText.length} chars).`,
+              `Split patch into smaller replacements <= ${MAX_PATCH_REPLACE_CHARS} chars.`
+            ].join(" "),
+            progress: false
+          };
+        }
+        return this.applyPatchFile(filePath, findText, replaceText, replaceAll);
       }
 
       case "run_command": {
@@ -750,19 +979,24 @@ export class LocalAgentRunner {
       }
 
       case "complete_step": {
+        const summary = toStringValue(action.summary, "Step completed.");
         if (this.changedFiles.size > 0 && !this.verificationAttempted) {
           return {
-            kind: "tool",
-            message:
-              "QualityGuard: code changed but no verification command was attempted. Run test/lint/typecheck/build first.",
-            progress: false
+            kind: "complete",
+            message: `${summary} (Verification pending: run a relevant test/lint/typecheck/build command in later step.)`,
+            progress: true
           };
         }
-        const summary = toStringValue(action.summary, "Step completed.");
         return { kind: "complete", message: summary, progress: true };
       }
 
       case "final_answer": {
+        if (this.currentTaskScope?.isTestTask) {
+          const testQualityIssue = await this.validateChangedTestFilesQuality();
+          if (testQualityIssue) {
+            return { kind: "tool", message: testQualityIssue, progress: false };
+          }
+        }
         if (this.changedFiles.size > 0 && !this.verificationAttempted) {
           return {
             kind: "tool",
@@ -785,7 +1019,16 @@ export class LocalAgentRunner {
   }
 
   private async buildRecoveryAction(step: PlanStep, investigationCount: number): Promise<AgentAction> {
+    const scope = this.currentTaskScope;
+
     if (investigationCount <= 0) {
+      if (scope?.isTestTask) {
+        return {
+          type: "list_files",
+          pattern: await this.pickTestListPatternFromScope(),
+          limit: 500
+        };
+      }
       return {
         type: "list_files",
         pattern: "**/*",
@@ -794,6 +1037,18 @@ export class LocalAgentRunner {
     }
 
     if (investigationCount <= 1) {
+      if (scope?.isTestTask) {
+        const focusedTestFile = await this.findFirstTestFileForScope();
+        if (focusedTestFile) {
+          return {
+            type: "read_file",
+            path: focusedTestFile,
+            startLine: 1,
+            endLine: 260
+          };
+        }
+      }
+
       const bootstrapFile = await this.findFirstExistingFile([
         "README.md",
         "package.json",
@@ -847,6 +1102,44 @@ export class LocalAgentRunner {
       }
     }
     return "**/*";
+  }
+
+  private async pickTestListPatternFromScope(): Promise<string> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const hasIntegrationTest = files.some((file) => file.startsWith("integration_test/"));
+    if (hasIntegrationTest) {
+      return "integration_test/**/*";
+    }
+    const hasTestDir = files.some((file) => file.startsWith("test/"));
+    if (hasTestDir) {
+      return "test/**/*";
+    }
+    const hasSpecDir = files.some((file) => file.startsWith("spec/"));
+    if (hasSpecDir) {
+      return "spec/**/*";
+    }
+    return "**/*test*";
+  }
+
+  private async findFirstTestFileForScope(): Promise<string | undefined> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const scope = this.currentTaskScope;
+    const testFiles = files.filter((file) => this.isLikelyTestFile(file.toLowerCase()));
+    if (testFiles.length === 0) {
+      return undefined;
+    }
+
+    if (scope && scope.focusTerms.length > 0) {
+      const focused = testFiles.find((file) => this.pathMatchesFocusTerms(file, scope.focusTerms));
+      if (focused) {
+        return focused;
+      }
+    }
+
+    const preferred = testFiles.find(
+      (file) => file.startsWith("integration_test/") || file.startsWith("test/")
+    );
+    return preferred ?? testFiles[0];
   }
 
   private extractStepKeywords(step: PlanStep, max = 4): string[] {
@@ -1126,11 +1419,30 @@ export class LocalAgentRunner {
   }
 
   private requiresInvestigation(type: string): boolean {
-    return ["write_file", "run_command", "complete_step", "final_answer"].includes(type);
+    return ["write_file", "append_file", "patch_file", "run_command", "complete_step", "final_answer"].includes(type);
+  }
+
+  private computeRequiredInvestigationsForStep(): number {
+    const base = Math.max(1, this.config.minInvestigationsBeforeExecute);
+    const scope = this.currentTaskScope;
+
+    if (this.totalInvestigationActions === 0) {
+      return base;
+    }
+
+    if (scope?.isTestTask) {
+      return Math.max(1, Math.min(2, base));
+    }
+
+    return Math.max(1, Math.min(2, base));
   }
 
   private isInvestigationAction(type: string): boolean {
     return ["list_files", "read_file", "search_code"].includes(type);
+  }
+
+  private isExecutionAction(type: string): boolean {
+    return ["write_file", "append_file", "patch_file", "run_command"].includes(type);
   }
 
   private buildInvestigationGuardMessage(
@@ -1171,6 +1483,11 @@ export class LocalAgentRunner {
       write: "write_file",
       writefile: "write_file",
       edit: "write_file",
+      append: "append_file",
+      appendfile: "append_file",
+      patch: "patch_file",
+      patchfile: "patch_file",
+      replace: "patch_file",
       run: "run_command",
       runcommand: "run_command",
       command: "run_command",
@@ -1186,42 +1503,363 @@ export class LocalAgentRunner {
     return aliases[normalized] ?? normalized;
   }
 
+  private getExecutorMaxTokens(): number {
+    const raw = Number(this.config.executorMaxTokens);
+    if (!Number.isFinite(raw)) {
+      return 3200;
+    }
+    return Math.max(600, Math.min(8000, Math.floor(raw)));
+  }
+
+  private toStreamPreview(value: string, maxChars = 900): string {
+    const text = value || "";
+    if (text.length <= maxChars) {
+      return text;
+    }
+    return `...${text.slice(text.length - maxChars)}`;
+  }
+
+  private isLikelyTruncatedWritePayload(rawResponse: string, parseErrorMessage: string): boolean {
+    const lowerError = parseErrorMessage.toLowerCase();
+    const looksTruncated =
+      lowerError.includes("unterminated string") ||
+      lowerError.includes("unexpected end of json") ||
+      lowerError.includes("end of json input");
+    if (!looksTruncated) {
+      return false;
+    }
+
+    const lowerRaw = rawResponse.toLowerCase();
+    return (
+      lowerRaw.includes("write_file") ||
+      lowerRaw.includes("append_file") ||
+      lowerRaw.includes("patch_file") ||
+      lowerRaw.includes("\"content\"") ||
+      lowerRaw.includes("\"replace\"") ||
+      lowerRaw.includes("\"path\"")
+    );
+  }
+
+  private resolveWriteContent(action: AgentAction): string | undefined {
+    if (typeof action.content === "string") {
+      return action.content;
+    }
+
+    const linesRaw = action.content_lines ?? action.contentLines;
+    if (Array.isArray(linesRaw)) {
+      return linesRaw.map((line) => (typeof line === "string" ? line : String(line ?? ""))).join("\n");
+    }
+
+    const contentBase64 = toStringValue(action.contentBase64) || toStringValue(action.content_base64);
+    if (contentBase64.trim().length > 0) {
+      try {
+        return Buffer.from(contentBase64, "base64").toString("utf8");
+      } catch {
+        return undefined;
+      }
+    }
+
+    return undefined;
+  }
+
+  private resolvePatchReplaceText(action: AgentAction): string | undefined {
+    const direct =
+      toStringValue(action.replace) ||
+      toStringValue(action.replacement) ||
+      toStringValue(action.replaceText) ||
+      toStringValue(action.newText);
+    if (direct.length > 0) {
+      return direct;
+    }
+
+    const linesRaw = action.replace_lines ?? action.replaceLines;
+    if (Array.isArray(linesRaw)) {
+      return linesRaw.map((line) => (typeof line === "string" ? line : String(line ?? ""))).join("\n");
+    }
+
+    const base64 = toStringValue(action.replaceBase64) || toStringValue(action.replace_base64);
+    if (base64.trim().length > 0) {
+      try {
+        return Buffer.from(base64, "base64").toString("utf8");
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  private async applyWriteFile(
+    filePath: string,
+    content: string,
+    options: { mode: "overwrite" | "append"; allowCreate: boolean; allowDuplicate: boolean }
+  ): Promise<ActionExecutionResult> {
+    try {
+      const absPath = this.resolveWorkspacePath(filePath);
+      const relPath = this.toRelative(absPath);
+      const pathGuard = this.evaluatePathAccessGuard(relPath, "write");
+      if (pathGuard) {
+        return { kind: "tool", message: pathGuard, progress: false };
+      }
+
+      const existsBeforeWrite = await this.fileExists(absPath);
+      if (!existsBeforeWrite && !options.allowCreate) {
+        return {
+          kind: "tool",
+          message: `append_file failed: '${relPath}' does not exist. Set allowCreate=true to create it first.`,
+          progress: false
+        };
+      }
+
+      if (!existsBeforeWrite && options.mode === "overwrite") {
+        const duplicateCandidates = await this.findLikelyDuplicateFiles(relPath);
+        if (!options.allowDuplicate && duplicateCandidates.length > 0) {
+          return {
+            kind: "tool",
+            message: [
+              `DuplicateGuard: creating '${relPath}' may duplicate existing files.`,
+              `Potential duplicates: ${duplicateCandidates.join(", ")}`,
+              "If this is truly a separate file, set allowDuplicate=true. Otherwise edit existing file."
+            ].join(" "),
+            progress: false
+          };
+        }
+      }
+
+      let finalContent = content;
+      if (options.mode === "append" && existsBeforeWrite) {
+        const existing = await fs.readFile(absPath, "utf8");
+        finalContent = `${existing}${content}`;
+      }
+
+      const writeScopeBlock = await this.evaluateWriteScopeGuard(relPath, existsBeforeWrite, finalContent);
+      if (writeScopeBlock) {
+        return { kind: "tool", message: writeScopeBlock, progress: false };
+      }
+
+      await fs.mkdir(path.dirname(absPath), { recursive: true });
+      if (options.mode === "append" && existsBeforeWrite) {
+        await fs.appendFile(absPath, content, "utf8");
+      } else {
+        await fs.writeFile(absPath, options.mode === "append" ? finalContent : content, "utf8");
+      }
+
+      this.markChangedFile(relPath);
+      const verb =
+        options.mode === "append" ? `Appended ${content.length} chars to` : existsBeforeWrite ? "Updated" : "Created";
+      return {
+        kind: "tool",
+        message: `${verb} ${relPath} (${content.length} chars${options.mode === "append" ? " chunk" : ""}).`,
+        progress: true
+      };
+    } catch (error) {
+      const actionName = options.mode === "append" ? "append_file" : "write_file";
+      return {
+        kind: "tool",
+        message: `${actionName} failed for ${filePath}: ${(error as Error).message}`,
+        progress: false
+      };
+    }
+  }
+
+  private async applyPatchFile(
+    filePath: string,
+    findText: string,
+    replaceText: string,
+    replaceAll: boolean
+  ): Promise<ActionExecutionResult> {
+    try {
+      const absPath = this.resolveWorkspacePath(filePath);
+      const relPath = this.toRelative(absPath);
+      const pathGuard = this.evaluatePathAccessGuard(relPath, "write");
+      if (pathGuard) {
+        return { kind: "tool", message: pathGuard, progress: false };
+      }
+
+      const existsBeforeWrite = await this.fileExists(absPath);
+      if (!existsBeforeWrite) {
+        return { kind: "tool", message: `patch_file failed: '${relPath}' does not exist.`, progress: false };
+      }
+
+      const original = await fs.readFile(absPath, "utf8");
+      if (!original.includes(findText)) {
+        return {
+          kind: "tool",
+          message: `patch_file failed: pattern not found in '${relPath}'.`,
+          progress: false
+        };
+      }
+
+      const updated = replaceAll ? original.split(findText).join(replaceText) : original.replace(findText, replaceText);
+      const writeScopeBlock = await this.evaluateWriteScopeGuard(relPath, true, updated);
+      if (writeScopeBlock) {
+        return { kind: "tool", message: writeScopeBlock, progress: false };
+      }
+
+      await fs.writeFile(absPath, updated, "utf8");
+      this.markChangedFile(relPath);
+
+      const occurrences = replaceAll ? Math.max(0, original.split(findText).length - 1) : 1;
+      return {
+        kind: "tool",
+        message: `Patched ${relPath}: replaced ${occurrences} occurrence(s).`,
+        progress: true
+      };
+    } catch (error) {
+      return {
+        kind: "tool",
+        message: `patch_file failed for ${filePath}: ${(error as Error).message}`,
+        progress: false
+      };
+    }
+  }
+
+  private markChangedFile(relPath: string): void {
+    this.changedFiles.add(relPath);
+    this.executorSnapshotCache = undefined;
+    if (this.workspaceFileIndexCache && !this.workspaceFileIndexCache.includes(relPath)) {
+      this.workspaceFileIndexCache.push(relPath);
+      this.workspaceFileIndexCache.sort((a, b) => a.localeCompare(b));
+    }
+  }
+
   private safeActionPreview(action: AgentAction): string {
     const copy: Record<string, unknown> = { ...action };
     if (typeof copy.content === "string" && copy.content.length > 180) {
       copy.content = `${copy.content.slice(0, 180)}...`;
     }
+    if (typeof copy.replace === "string" && copy.replace.length > 180) {
+      copy.replace = `${copy.replace.slice(0, 180)}...`;
+    }
+    if (typeof copy.replacement === "string" && copy.replacement.length > 180) {
+      copy.replacement = `${copy.replacement.slice(0, 180)}...`;
+    }
+    if (Array.isArray(copy.content_lines) && copy.content_lines.length > 10) {
+      copy.content_lines = [...copy.content_lines.slice(0, 10), "..."];
+    }
+    if (Array.isArray(copy.contentLines) && copy.contentLines.length > 10) {
+      copy.contentLines = [...copy.contentLines.slice(0, 10), "..."];
+    }
+    if (Array.isArray(copy.replace_lines) && copy.replace_lines.length > 10) {
+      copy.replace_lines = [...copy.replace_lines.slice(0, 10), "..."];
+    }
+    if (Array.isArray(copy.replaceLines) && copy.replaceLines.length > 10) {
+      copy.replaceLines = [...copy.replaceLines.slice(0, 10), "..."];
+    }
+    if (typeof copy.contentBase64 === "string" && copy.contentBase64.length > 120) {
+      copy.contentBase64 = `${copy.contentBase64.slice(0, 120)}...`;
+    }
+    if (typeof copy.content_base64 === "string" && copy.content_base64.length > 120) {
+      copy.content_base64 = `${copy.content_base64.slice(0, 120)}...`;
+    }
     return JSON.stringify(copy);
   }
 
   private async listFiles(pattern: string, limit: number): Promise<string[]> {
-    const relativePattern = new vscode.RelativePattern(this.config.workspaceRoot, pattern);
+    const requestedPattern = pattern.trim() || "**/*";
+    const broadPattern = this.isBroadListPattern(requestedPattern);
+    if (broadPattern) {
+      const roots = await this.getProjectFirstRoots();
+      const seen = new Set<string>();
+
+      for (const root of roots) {
+        if (seen.size >= limit) {
+          break;
+        }
+        const rootPattern = new vscode.RelativePattern(this.config.workspaceRoot, `${root}/**/*`);
+        const files = await vscode.workspace.findFiles(rootPattern, SEARCH_EXCLUDE, limit);
+        for (const file of files) {
+          const rel = this.toRelative(file.fsPath);
+          if (this.isFrameworkOrGeneratedPath(rel)) {
+            continue;
+          }
+          seen.add(rel);
+          if (seen.size >= limit) {
+            break;
+          }
+        }
+      }
+
+      if (seen.size < limit) {
+        const relativePattern = new vscode.RelativePattern(this.config.workspaceRoot, requestedPattern);
+        const files = await vscode.workspace.findFiles(relativePattern, SEARCH_EXCLUDE, limit);
+        const remainder = files
+          .map((file) => this.toRelative(file.fsPath))
+          .filter((file) => !this.isFrameworkOrGeneratedPath(file))
+          .sort((a, b) => this.comparePathPriority(a, b));
+        for (const rel of remainder) {
+          seen.add(rel);
+          if (seen.size >= limit) {
+            break;
+          }
+        }
+      }
+
+      return Array.from(seen.values()).slice(0, limit);
+    }
+
+    const relativePattern = new vscode.RelativePattern(this.config.workspaceRoot, requestedPattern);
     const files = await vscode.workspace.findFiles(relativePattern, SEARCH_EXCLUDE, limit);
-    return files.map((file) => this.toRelative(file.fsPath)).sort((a, b) => a.localeCompare(b));
+    return files
+      .map((file) => this.toRelative(file.fsPath))
+      .filter((file) => !this.isFrameworkOrGeneratedPath(file))
+      .sort((a, b) => this.comparePathPriority(a, b));
   }
 
   private async searchCode(pattern: string, limit: number): Promise<string[]> {
     try {
-      const { stdout } = await execFileAsync(
-        "rg",
-        ["-n", "--no-heading", "--color", "never", "-i", pattern, "."],
-        {
-          cwd: this.config.workspaceRoot,
-          timeout: this.config.commandTimeoutMs,
-          maxBuffer: 4 * 1024 * 1024
-        }
-      );
+      const roots = await this.getProjectFirstRoots();
+      const preferredTargets = roots.length > 0 ? roots : ["."]; // keep search local to source first
+      const preferred = await this.runRipgrep(pattern, limit, preferredTargets);
+      if (preferred.length >= limit || preferredTargets[0] === ".") {
+        return this.sortSearchResultsByPriority(preferred).slice(0, limit);
+      }
 
+      const fallback = await this.runRipgrep(pattern, limit, ["."]);
+      const merged = new Set<string>(preferred);
+      for (const item of fallback) {
+        if (this.isFrameworkOrGeneratedSearchResult(item)) {
+          continue;
+        }
+        merged.add(item);
+        if (merged.size >= limit) {
+          break;
+        }
+      }
+      return this.sortSearchResultsByPriority(Array.from(merged.values())).slice(0, limit);
+    } catch (error) {
+      return this.searchCodeFallback(pattern, limit);
+    }
+  }
+
+  private async runRipgrep(pattern: string, limit: number, targets: string[]): Promise<string[]> {
+    try {
+      const targetArgs = targets.length > 0 ? targets : ["."];
+      const rgArgs = [
+        "-n",
+        "--no-heading",
+        "--color",
+        "never",
+        "-i",
+        ...RG_SEARCH_EXCLUDE_GLOBS.flatMap((glob) => ["--glob", glob]),
+        pattern,
+        ...targetArgs
+      ];
+      const { stdout } = await execFileAsync("rg", rgArgs, {
+        cwd: this.config.workspaceRoot,
+        timeout: this.config.commandTimeoutMs,
+        maxBuffer: 4 * 1024 * 1024
+      });
       return stdout
         .split(/\r?\n/g)
         .filter(Boolean)
+        .filter((line) => !this.isFrameworkOrGeneratedSearchResult(line))
         .slice(0, limit);
     } catch (error) {
       const e = error as { code?: number };
       if (e.code === 1) {
         return [];
       }
-      return this.searchCodeFallback(pattern, limit);
+      throw error;
     }
   }
 
@@ -1231,6 +1869,9 @@ export class LocalAgentRunner {
     const lowerPattern = pattern.toLowerCase();
 
     for (const relPath of files) {
+      if (this.isFrameworkOrGeneratedPath(relPath)) {
+        continue;
+      }
       if (results.length >= limit) {
         break;
       }
@@ -1254,6 +1895,162 @@ export class LocalAgentRunner {
     }
 
     return results;
+  }
+
+  private isBroadListPattern(pattern: string): boolean {
+    const normalized = pattern.trim().toLowerCase();
+    return normalized.length === 0 || normalized === "*" || normalized === "**" || normalized === "**/*";
+  }
+
+  private async getProjectFirstRoots(): Promise<string[]> {
+    const preferred = this.currentTaskScope?.isTestTask ? TEST_FIRST_ROOTS : SOURCE_FIRST_ROOTS;
+    const found: string[] = [];
+    for (const dir of preferred) {
+      try {
+        const abs = this.resolveWorkspacePath(dir);
+        const stats = await fs.stat(abs);
+        if (stats.isDirectory()) {
+          found.push(dir);
+        }
+      } catch {
+        // Ignore missing folders.
+      }
+    }
+    return found;
+  }
+
+  private comparePathPriority(leftPath: string, rightPath: string): number {
+    const leftRank = this.getPathPriorityRank(leftPath);
+    const rightRank = this.getPathPriorityRank(rightPath);
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    return leftPath.localeCompare(rightPath);
+  }
+
+  private getPathPriorityRank(relativePath: string): number {
+    const lower = relativePath.replace(/\\/g, "/").toLowerCase();
+    if (this.isFrameworkOrGeneratedPath(lower)) {
+      return 100;
+    }
+    const roots = this.currentTaskScope?.isTestTask ? TEST_FIRST_ROOTS : SOURCE_FIRST_ROOTS;
+    for (let i = 0; i < roots.length; i += 1) {
+      const root = roots[i];
+      if (lower === root || lower.startsWith(`${root}/`)) {
+        return i;
+      }
+    }
+    return roots.length + 1;
+  }
+
+  private sortSearchResultsByPriority(results: string[]): string[] {
+    return [...results].sort((a, b) => {
+      const aPath = a.split(":")[0] || a;
+      const bPath = b.split(":")[0] || b;
+      return this.comparePathPriority(aPath, bPath);
+    });
+  }
+
+  private isFrameworkOrGeneratedSearchResult(line: string): boolean {
+    const pathPart = line.split(":")[0] || "";
+    return this.isFrameworkOrGeneratedPath(pathPart);
+  }
+
+  private isFrameworkOrGeneratedPath(relativePath: string): boolean {
+    const lower = relativePath.replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
+    if (
+      lower.startsWith(".fvm/") ||
+      lower.startsWith(".pub-cache/") ||
+      lower.startsWith(".dart_tool/") ||
+      lower.startsWith(".git/") ||
+      lower.startsWith("node_modules/") ||
+      lower.startsWith("vendor/") ||
+      lower.startsWith("pods/") ||
+      lower.startsWith("build/") ||
+      lower.startsWith("dist/")
+    ) {
+      return true;
+    }
+    if (
+      lower.startsWith("ios/flutter/") ||
+      lower.startsWith("ios/pods/") ||
+      lower.startsWith("android/.gradle/") ||
+      lower.startsWith("android/.cxx/") ||
+      lower.startsWith("android/build/") ||
+      lower.startsWith("macos/flutter/") ||
+      lower.startsWith("linux/flutter/") ||
+      lower.startsWith("windows/flutter/")
+    ) {
+      return true;
+    }
+    return (
+      lower.includes("/flutter_sdk/") ||
+      lower.includes("/.pub-cache/") ||
+      lower.includes("/ephemeral/")
+    );
+  }
+
+  private evaluateListPatternGuard(pattern: string): string | undefined {
+    if (this.taskExplicitlyAllowsFrameworkAccess()) {
+      return undefined;
+    }
+    const lower = pattern.toLowerCase();
+    const blockedHints = [
+      ".fvm",
+      ".pub-cache",
+      "flutter_sdk",
+      "ios/flutter",
+      "ios/pods",
+      "android/.gradle",
+      "android/.cxx",
+      "macos/flutter",
+      "linux/flutter",
+      "windows/flutter",
+      "vendor",
+      "node_modules"
+    ];
+    if (blockedHints.some((hint) => lower.includes(hint))) {
+      return [
+        "PathGuard: list_files pattern points to framework/dependency directories.",
+        "Search project code first in lib/, src/, test/, integration_test/."
+      ].join(" ");
+    }
+    return undefined;
+  }
+
+  private evaluatePathAccessGuard(relPath: string, mode: "read" | "write"): string | undefined {
+    if (this.taskExplicitlyAllowsFrameworkAccess()) {
+      return undefined;
+    }
+    if (!this.isFrameworkOrGeneratedPath(relPath)) {
+      return undefined;
+    }
+    return [
+      `PathGuard: blocked ${mode} on '${relPath}'.`,
+      "This path is framework/dependency/generated area and usually off-scope.",
+      "Focus on project files in lib/, src/, test/, integration_test/."
+    ].join(" ");
+  }
+
+  private taskExplicitlyAllowsFrameworkAccess(): boolean {
+    const text = this.currentTaskScope?.rawTask?.toLowerCase() ?? "";
+    if (!text) {
+      return false;
+    }
+    const signals = [
+      "framework",
+      "flutter sdk",
+      "sdk",
+      "vendor",
+      "third-party",
+      "third party",
+      "generated",
+      ".fvm",
+      ".pub-cache",
+      "ios/flutter",
+      "android/.gradle"
+    ];
+    return signals.some((signal) => text.includes(signal));
   }
 
   private async fileExists(absPath: string): Promise<boolean> {
@@ -1373,7 +2170,7 @@ export class LocalAgentRunner {
       }
     }
 
-    scored.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
+    scored.sort((a, b) => b.score - a.score || this.comparePathPriority(a.file, b.file));
     return scored.slice(0, limit).map((item) => item.file);
   }
 
@@ -1786,7 +2583,11 @@ export class LocalAgentRunner {
     };
   }
 
-  private evaluateWriteScopeGuard(relPath: string, existsBeforeWrite: boolean): string | undefined {
+  private async evaluateWriteScopeGuard(
+    relPath: string,
+    existsBeforeWrite: boolean,
+    content: string
+  ): Promise<string | undefined> {
     const scope = this.currentTaskScope;
     if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
       return undefined;
@@ -1801,11 +2602,44 @@ export class LocalAgentRunner {
     const testFile = this.isLikelyTestFile(lowerPath);
     const globalFile = this.isGlobalProjectFile(lowerPath);
 
-    if (scope.isTestTask && !testFile && !touchesFocus) {
-      return [
-        `ScopeGuard: '${relPath}' is outside test-focused scope.`,
-        "For test tasks, edit test files or files directly tied to target module terms."
-      ].join(" ");
+    if (scope.isTestTask) {
+      if (!testFile) {
+        return [
+          `ScopeGuard: '${relPath}' is outside test-focused scope.`,
+          "For test tasks, only write test/spec files and reuse existing source structure."
+        ].join(" ");
+      }
+
+      const knownTestDirs = await this.getKnownTestDirectories();
+      if (
+        !touchesFocus &&
+        knownTestDirs.length > 0 &&
+        !knownTestDirs.some((dir) => this.isPathInsideDirectory(relPath, dir))
+      ) {
+        return [
+          `ScopeGuard: '${relPath}' is outside current test directories (${knownTestDirs.slice(0, 5).join(", ")}).`,
+          "Reuse existing test folder structure instead of creating a parallel one."
+        ].join(" ");
+      }
+
+      if (!existsBeforeWrite) {
+        const relatedTestFiles = await this.findRelatedExistingTestFiles(scope.focusTerms, 6);
+        if (
+          relatedTestFiles.length > 0 &&
+          !relatedTestFiles.includes(relPath) &&
+          !relatedTestFiles.some((candidate) => this.isSiblingPath(relPath, candidate))
+        ) {
+          return [
+            `ReuseGuard: existing related test file(s) found: ${relatedTestFiles.join(", ")}.`,
+            `Avoid creating unrelated new test file '${relPath}'. Update the closest existing test file first.`
+          ].join(" ");
+        }
+      }
+
+      const qualityBlock = this.evaluateTestContentQuality(relPath, content);
+      if (qualityBlock) {
+        return qualityBlock;
+      }
     }
 
     if ((scope.scopeClass === "micro" || scope.scopeClass === "small") && globalFile && !touchesFocus) {
@@ -1850,6 +2684,96 @@ export class LocalAgentRunner {
 
     if ((scope.scopeClass === "micro" || scope.scopeClass === "small") && /\bcodemod\b|\bmigrate\b/.test(lower)) {
       return "ScopeGuard: broad migration command blocked for narrow task scope.";
+    }
+
+    return undefined;
+  }
+
+  private async getKnownTestDirectories(): Promise<string[]> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const dirs = new Set<string>();
+    for (const file of files) {
+      const lower = file.toLowerCase();
+      if (!this.isLikelyTestFile(lower)) {
+        continue;
+      }
+      const dir = path.posix.dirname(file);
+      if (!dir || dir === ".") {
+        continue;
+      }
+      dirs.add(dir);
+    }
+    return Array.from(dirs).sort((a, b) => a.localeCompare(b)).slice(0, 30);
+  }
+
+  private async findRelatedExistingTestFiles(focusTerms: string[], limit: number): Promise<string[]> {
+    if (!Array.isArray(focusTerms) || focusTerms.length === 0) {
+      return [];
+    }
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    return files
+      .filter((file) => this.isLikelyTestFile(file.toLowerCase()) && this.pathMatchesFocusTerms(file, focusTerms))
+      .slice(0, Math.max(1, limit));
+  }
+
+  private isPathInsideDirectory(relPath: string, directory: string): boolean {
+    const normalizedPath = relPath.replace(/\\/g, "/").toLowerCase();
+    const normalizedDir = directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    if (!normalizedDir) {
+      return false;
+    }
+    return normalizedPath === normalizedDir || normalizedPath.startsWith(`${normalizedDir}/`);
+  }
+
+  private isSiblingPath(relPath: string, candidate: string): boolean {
+    const left = path.posix.dirname(relPath.toLowerCase());
+    const right = path.posix.dirname(candidate.toLowerCase());
+    return left === right;
+  }
+
+  private evaluateTestContentQuality(relPath: string, content: string): string | undefined {
+    const lowerPath = relPath.toLowerCase();
+    if (!this.isLikelyTestFile(lowerPath)) {
+      return undefined;
+    }
+
+    const body = content.trim();
+    if (body.length < 220) {
+      return `QualityGuard: '${relPath}' test content is too short. Write a realistic integration test with full setup, actions, and assertions.`;
+    }
+
+    const caseCount = (body.match(/\b(test|it|testwidgets|describe)\s*\(/gi) ?? []).length;
+    if (caseCount < 1) {
+      return `QualityGuard: '${relPath}' has no detectable test case block (test/it/testWidgets/describe).`;
+    }
+
+    const assertionCount = (body.match(/\b(expect|assert|verify)\s*\(/gi) ?? []).length;
+    if (assertionCount < 1) {
+      return `QualityGuard: '${relPath}' has no assertions (expect/assert/verify).`;
+    }
+
+    return undefined;
+  }
+
+  private async validateChangedTestFilesQuality(): Promise<string | undefined> {
+    const testFiles = Array.from(this.changedFiles.values()).filter((file) =>
+      this.isLikelyTestFile(file.toLowerCase())
+    );
+    if (testFiles.length === 0) {
+      return "QualityGuard: task is test-focused but no test file was changed.";
+    }
+
+    for (const relPath of testFiles) {
+      try {
+        const absPath = this.resolveWorkspacePath(relPath);
+        const content = await fs.readFile(absPath, "utf8");
+        const issue = this.evaluateTestContentQuality(relPath, content);
+        if (issue) {
+          return issue;
+        }
+      } catch {
+        return `QualityGuard: unable to read changed test file '${relPath}' for validation.`;
+      }
     }
 
     return undefined;
