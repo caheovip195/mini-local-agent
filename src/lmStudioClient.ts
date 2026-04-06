@@ -3,6 +3,8 @@ export interface ChatMessage {
   content: string;
 }
 
+export type ThinkingEffort = "low" | "medium" | "high";
+
 interface ClientOptions {
   baseUrl: string;
   apiKey: string;
@@ -21,6 +23,8 @@ interface ChatOptions {
   model?: string;
   stream?: boolean;
   onDelta?: (delta: string) => void;
+  responseFormat?: "json_object";
+  thinkingEffort?: ThinkingEffort;
 }
 
 export interface TokenUsage {
@@ -129,28 +133,41 @@ export class LmStudioClient {
     let lastError: Error | undefined;
     const requestedModel = options?.model?.trim() || this.model;
     const streamRequested = options?.stream === true;
+    let effectiveOptions: ChatOptions = { ...(options ?? {}) };
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         if (streamRequested) {
           try {
-            return await this.chatStream(messages, requestedModel, signal, options);
+            return await this.chatStream(messages, requestedModel, signal, effectiveOptions);
           } catch (streamError) {
             const streamEmitted = (streamError as { streamEmitted?: boolean }).streamEmitted === true;
             if (!streamEmitted) {
-              return await this.chatJson(messages, requestedModel, signal, options);
+              return await this.chatJson(messages, requestedModel, signal, effectiveOptions);
             }
             throw streamError;
           }
         }
 
-        return await this.chatJson(messages, requestedModel, signal, options);
+        return await this.chatJson(messages, requestedModel, signal, effectiveOptions);
       } catch (error) {
         if (signal?.aborted) {
           throw new Error(`${this.providerName} request cancelled.`);
         }
 
         lastError = error instanceof Error ? error : new Error(String(error));
+        if (effectiveOptions.responseFormat && this.isResponseFormatUnsupportedError(lastError.message)) {
+          effectiveOptions = { ...effectiveOptions, responseFormat: undefined };
+          if (attempt < 2) {
+            continue;
+          }
+        }
+        if (effectiveOptions.thinkingEffort && this.isThinkingUnsupportedError(lastError.message)) {
+          effectiveOptions = { ...effectiveOptions, thinkingEffort: undefined };
+          if (attempt < 2) {
+            continue;
+          }
+        }
         if (attempt >= 2) {
           break;
         }
@@ -160,6 +177,39 @@ export class LmStudioClient {
     }
 
     throw lastError ?? new Error(`${this.providerName} request failed.`);
+  }
+
+  private isResponseFormatUnsupportedError(message: string): boolean {
+    const text = message.toLowerCase();
+    const mentionsResponseFormat = text.includes("response_format") || text.includes("response format");
+    const unsupportedSignal =
+      text.includes("unsupported") ||
+      text.includes("not support") ||
+      text.includes("unknown") ||
+      text.includes("invalid") ||
+      text.includes("unexpected") ||
+      text.includes("must be") ||
+      text.includes("expected") ||
+      text.includes("json_schema") ||
+      text.includes("json schema");
+    return mentionsResponseFormat && unsupportedSignal;
+  }
+
+  private isThinkingUnsupportedError(message: string): boolean {
+    const text = message.toLowerCase();
+    const mentionsThinking =
+      text.includes("reasoning_effort") ||
+      text.includes("reasoning") ||
+      text.includes("thinking") ||
+      text.includes("extra inputs are not permitted");
+    const unsupportedSignal =
+      text.includes("unsupported") ||
+      text.includes("not support") ||
+      text.includes("unknown") ||
+      text.includes("invalid") ||
+      text.includes("unexpected") ||
+      text.includes("extra inputs are not permitted");
+    return mentionsThinking && unsupportedSignal;
   }
 
   private async chatJson(
@@ -176,7 +226,14 @@ export class LmStudioClient {
         messages,
         temperature: options?.temperature ?? 0.15,
         max_tokens: options?.maxTokens ?? 1200,
-        stream: false
+        stream: false,
+        ...(options?.thinkingEffort
+          ? {
+              reasoning_effort: options.thinkingEffort,
+              reasoning: { effort: options.thinkingEffort }
+            }
+          : {}),
+        ...(options?.responseFormat === "json_object" ? { response_format: { type: "json_object" } } : {})
       }),
       signal
     });
@@ -212,15 +269,22 @@ export class LmStudioClient {
       const response = await fetch(this.joinUrl(this.chatPath), {
         method: "POST",
         headers: this.buildHeaders(true),
-        body: JSON.stringify({
-          model: requestedModel,
-          messages,
-          temperature: options?.temperature ?? 0.15,
-          max_tokens: options?.maxTokens ?? 1200,
-          stream: true
-        }),
-        signal
-      });
+      body: JSON.stringify({
+        model: requestedModel,
+        messages,
+        temperature: options?.temperature ?? 0.15,
+        max_tokens: options?.maxTokens ?? 1200,
+        stream: true,
+        ...(options?.thinkingEffort
+          ? {
+              reasoning_effort: options.thinkingEffort,
+              reasoning: { effort: options.thinkingEffort }
+            }
+          : {}),
+        ...(options?.responseFormat === "json_object" ? { response_format: { type: "json_object" } } : {})
+      }),
+      signal
+    });
 
       if (!response.ok) {
         const errorText = await response.text();

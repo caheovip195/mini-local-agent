@@ -25,6 +25,10 @@ export interface AgentDecision {
 
 export interface AgentConfig {
   workspaceRoot: string;
+  preferredLanguage: string;
+  thinkingEnabled: boolean;
+  thinkingEffort: "low" | "medium" | "high";
+  strictResponsibilityMode: boolean;
   maxTurnsPerStep: number;
   executorMaxTokens: number;
   maxAskUser: number;

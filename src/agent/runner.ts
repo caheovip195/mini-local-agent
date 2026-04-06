@@ -56,6 +56,7 @@ const NO_PROGRESS_WARNING_THRESHOLD = 3;
 const MAX_EXTRA_INVESTIGATION_ACTIONS = 3;
 const TURN_EXTENSION_CHUNK = 4;
 const MAX_TURN_EXTENSION_TOTAL = 18;
+const MAX_RESPONSIBILITY_BLOCKS_PER_STEP = 4;
 const MAX_WRITE_FILE_CONTENT_CHARS = 4200;
 const MAX_APPEND_FILE_CHUNK_CHARS = 2200;
 const MAX_PATCH_REPLACE_CHARS = 3200;
@@ -72,6 +73,11 @@ interface ActionExecutionResult {
   progress: boolean;
 }
 
+interface ResponsibilityReviewResult {
+  approve: boolean;
+  reason: string;
+}
+
 type ScopeClass = "micro" | "small" | "medium" | "broad";
 
 interface TaskScopeProfile {
@@ -81,6 +87,7 @@ interface TaskScopeProfile {
   allowRewrite: boolean;
   maxChangedFiles: number;
   focusTerms: string[];
+  primaryObjective: string;
   contract: string[];
 }
 
@@ -145,9 +152,9 @@ export class LocalAgentRunner {
       `Task scope: class=${scopeProfile.scopeClass}, testTask=${scopeProfile.isTestTask}, allowRewrite=${scopeProfile.allowRewrite}, maxChangedFiles=${scopeProfile.maxChangedFiles}, focus=${scopeProfile.focusTerms.join(", ") || "(none)"}`
     );
 
-    this.callbacks.onStatus("Analyzing workspace for planning...");
+    this.callbacks.onStatus(this.t("Analyzing workspace for planning...", "Đang phân tích workspace để lập kế hoạch..."));
     const workspaceContext = await this.getPlannerWorkspaceSnapshot();
-    this.callbacks.onStatus("Comparing implementation approaches...");
+    this.callbacks.onStatus(this.t("Comparing implementation approaches...", "Đang so sánh các hướng triển khai..."));
     this.selectedStrategyBrief = await this.buildImplementationStrategy(task, workspaceContext, scopeProfile, signal);
     this.callbacks.onLog(`Selected strategy:\n${this.selectedStrategyBrief}`);
 
@@ -164,6 +171,9 @@ export class LocalAgentRunner {
           "Task scope contract:",
           ...scopeProfile.contract,
           "",
+          `Primary objective lock: ${scopeProfile.primaryObjective}`,
+          `Preferred response language: ${this.getPreferredResponseLanguage()}`,
+          "",
           "Selected implementation strategy:",
           this.selectedStrategyBrief,
           "",
@@ -175,7 +185,12 @@ export class LocalAgentRunner {
       }
     ];
 
-    const plannerResponse = await this.client.chat(messages, signal, { temperature: 0.1, maxTokens: 1400 });
+    const plannerResponse = await this.client.chat(messages, signal, {
+      temperature: 0.1,
+      maxTokens: 1400,
+      thinkingEffort: this.getThinkingEffortOption(),
+      responseFormat: "json_object"
+    });
     const rawPlan = plannerResponse.content;
     if (plannerResponse.usage) {
       this.callbacks.onUsage?.({
@@ -198,7 +213,7 @@ export class LocalAgentRunner {
     this.totalInvestigationActions = 0;
     const plan = await this.createPlan(task, signal);
 
-    this.callbacks.onStatus("Preparing execution context...");
+    this.callbacks.onStatus(this.t("Preparing execution context...", "Đang chuẩn bị ngữ cảnh thực thi..."));
     await this.getExecutorWorkspaceSnapshot();
     const failedSteps: Array<{ id: string; title: string; error: string }> = [];
     let completedSteps = 0;
@@ -209,7 +224,9 @@ export class LocalAgentRunner {
       }
 
       this.callbacks.onStepStatus(step.id, "in_progress");
-      this.callbacks.onStatus(`Executing ${step.id}: ${step.title}`);
+      this.callbacks.onStatus(
+        this.t(`Executing ${step.id}: ${step.title}`, `Đang thực thi ${step.id}: ${step.title}`)
+      );
 
       try {
         const result = await this.executeStep(task, plan, step, signal);
@@ -228,22 +245,38 @@ export class LocalAgentRunner {
           error: text
         });
         this.callbacks.onLog(`Step ${step.id} failed: ${text}`);
-        this.callbacks.onStatus(`Step ${step.id} failed. Continuing with next step using assumptions...`);
+        this.callbacks.onStatus(
+          this.t(
+            `Step ${step.id} failed. Continuing with next step using assumptions...`,
+            `Bước ${step.id} thất bại. Tiếp tục bước kế tiếp với giả định phù hợp...`
+          )
+        );
         continue;
       }
     }
 
     const changed = Array.from(this.changedFiles.values());
     const summary = [
-      "Agent execution completed.",
-      `Completed steps: ${completedSteps}/${plan.steps.length}.`,
+      this.t("Agent execution completed.", "Agent đã hoàn tất thực thi."),
+      this.t(
+        `Completed steps: ${completedSteps}/${plan.steps.length}.`,
+        `Số bước hoàn thành: ${completedSteps}/${plan.steps.length}.`
+      ),
       failedSteps.length > 0
-        ? `Failed steps (${failedSteps.length}): ${failedSteps.map((step) => `${step.id} (${step.error})`).join("; ")}`
-        : "Failed steps: 0.",
-      changed.length > 0 ? `Changed files (${changed.length}): ${changed.join(", ")}` : "No files changed.",
+        ? this.t(
+            `Failed steps (${failedSteps.length}): ${failedSteps.map((step) => `${step.id} (${step.error})`).join("; ")}`,
+            `Bước thất bại (${failedSteps.length}): ${failedSteps.map((step) => `${step.id} (${step.error})`).join("; ")}`
+          )
+        : this.t("Failed steps: 0.", "Bước thất bại: 0."),
+      changed.length > 0
+        ? this.t(`Changed files (${changed.length}): ${changed.join(", ")}`, `Tệp đã đổi (${changed.length}): ${changed.join(", ")}`)
+        : this.t("No files changed.", "Không có tệp nào thay đổi."),
       changed.length > 0 && !this.verificationAttempted
-        ? "Verification warning: no test/lint/typecheck/build command was attempted."
-        : "Verification: attempted."
+        ? this.t(
+            "Verification warning: no test/lint/typecheck/build command was attempted.",
+            "Cảnh báo xác minh: chưa chạy lệnh test/lint/typecheck/build."
+          )
+        : this.t("Verification: attempted.", "Xác minh: đã thực hiện.")
     ].join("\n");
 
     this.callbacks.onDone(summary);
@@ -276,9 +309,12 @@ export class LocalAgentRunner {
           `Selected strategy:\n${this.selectedStrategyBrief}`,
           "Task scope contract:",
           ...(this.currentTaskScope?.contract ?? []),
+          `Primary objective lock: ${this.currentTaskScope?.primaryObjective ?? "Follow user request exactly."}`,
           "You have full read access to all files under workspace root.",
           "Never ask the user where files/screens/components are located; discover by list/search/read actions.",
           `Minimum investigation actions required before write/run/complete: ${minInvestigations}`,
+          "Action payload budget: keep one action JSON compact; if edit is large, split into multiple patch_file/append_file chunks.",
+          `Preferred response language: ${this.getPreferredResponseLanguage()}`,
           "Workspace context:",
           workspaceContext,
           "Return JSON action now."
@@ -292,6 +328,8 @@ export class LocalAgentRunner {
     let repeatedCount = 0;
     let repeatedActionBlocks = 0;
     let turnsWithoutProgress = 0;
+    let responsibilityBlocks = 0;
+    const seenInvestigationSignatures = new Set<string>();
     let stepTurnLimit = Math.max(3, this.config.maxTurnsPerStep);
     const stepTurnHardLimit = Math.max(stepTurnLimit, stepTurnLimit + MAX_TURN_EXTENSION_TOTAL);
     const changedFilesAtStepStart = this.changedFiles.size;
@@ -325,7 +363,9 @@ export class LocalAgentRunner {
       }
 
       this.compactStepMessages(stepMessages);
-      this.callbacks.onStatus(`Step ${step.id} turn ${turn}/${stepTurnLimit}`);
+      this.callbacks.onStatus(
+        this.t(`Step ${step.id} turn ${turn}/${stepTurnLimit}`, `Bước ${step.id} lượt ${turn}/${stepTurnLimit}`)
+      );
 
       const streamId = `${step.id}:turn${turn}`;
       let streamedText = "";
@@ -355,6 +395,8 @@ export class LocalAgentRunner {
           temperature: 0.1,
           maxTokens: this.getExecutorMaxTokens(),
           stream: true,
+          thinkingEffort: this.getThinkingEffortOption(),
+          responseFormat: "json_object",
           onDelta: (delta) => {
             if (!delta) {
               return;
@@ -526,11 +568,17 @@ export class LocalAgentRunner {
         }
       }
 
-      if (this.isInvestigationAction(actionType) && investigationCount >= maxInvestigations) {
+      const investigationSignature = this.buildInvestigationSignature(actionType, decision.action);
+      const isRepeatedInvestigation =
+        this.isInvestigationAction(actionType) &&
+        investigationSignature.length > 0 &&
+        seenInvestigationSignatures.has(investigationSignature);
+
+      if (this.isInvestigationAction(actionType) && investigationCount >= maxInvestigations && isRepeatedInvestigation) {
         const guardMessage = [
-          "ExplorationGuard: investigation budget reached for this step.",
+          "ExplorationGuard: investigation budget reached and action is repeating existing investigation evidence.",
           `Investigations done: ${investigationCount}/${maxInvestigations}.`,
-          "Stop searching and execute using current evidence with write_file, run_command, or complete_step."
+          "Use a different file/query or proceed with write_file, run_command, or complete_step."
         ].join(" ");
         this.callbacks.onLog(guardMessage);
         this.callbacks.onAction?.({
@@ -564,9 +612,43 @@ export class LocalAgentRunner {
         continue;
       }
 
+      if (this.shouldRunResponsibilityReview(actionType)) {
+        const review = await this.reviewActionForResponsibility(
+          task,
+          plan,
+          step,
+          decision.action,
+          investigationCount,
+          turn,
+          signal
+        );
+        if (!review.approve && responsibilityBlocks < MAX_RESPONSIBILITY_BLOCKS_PER_STEP) {
+          responsibilityBlocks += 1;
+          const guardMessage = [
+            `ResponsibilityGuard: ${review.reason}`,
+            `Action '${actionType}' blocked to prevent off-target execution.`,
+            `Primary objective: ${this.currentTaskScope?.primaryObjective ?? "Follow user request exactly."}`
+          ].join(" ");
+          this.callbacks.onLog(guardMessage);
+          this.callbacks.onAction?.({
+            stepId: step.id,
+            turn,
+            actionType,
+            status: "blocked",
+            detail: guardMessage
+          });
+          stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
+          turnsWithoutProgress += 1;
+          continue;
+        }
+      }
+
       if (this.isInvestigationAction(actionType)) {
         investigationCount += 1;
         this.totalInvestigationActions += 1;
+        if (investigationSignature.length > 0) {
+          seenInvestigationSignatures.add(investigationSignature);
+        }
       }
 
       const actionResult = await this.executeAction(decision.action, investigationCount);
@@ -602,7 +684,10 @@ export class LocalAgentRunner {
     }
 
     throw new Error(
-      `Step ${step.id} exceeded max turns (${stepTurnLimit}${extensionCount > 0 ? `, extended ${extensionCount} time(s)` : ""}). Agent may be looping.`
+      this.t(
+        `Step ${step.id} exceeded max turns (${stepTurnLimit}${extensionCount > 0 ? `, extended ${extensionCount} time(s)` : ""}). Agent may be looping.`,
+        `Bước ${step.id} đã vượt giới hạn lượt (${stepTurnLimit}${extensionCount > 0 ? `, đã gia hạn ${extensionCount} lần` : ""}). Có thể đang lặp.`
+      )
     );
   }
 
@@ -673,6 +758,14 @@ export class LocalAgentRunner {
             progress: false
           };
         }
+        const relevanceBlock = this.evaluateInvestigationRelevanceGuard("list_files", pattern, investigationCount);
+        if (relevanceBlock) {
+          return {
+            kind: "tool",
+            message: relevanceBlock,
+            progress: false
+          };
+        }
 
         try {
           const files = await this.listFiles(pattern, limit);
@@ -709,6 +802,14 @@ export class LocalAgentRunner {
               progress: false
             };
           }
+          const relevanceBlock = this.evaluateReadRelevanceGuard(relPath, investigationCount);
+          if (relevanceBlock) {
+            return {
+              kind: "tool",
+              message: relevanceBlock,
+              progress: false
+            };
+          }
           const content = await fs.readFile(absPath, "utf8");
           const lines = content.split(/\r?\n/g);
           const startLine = Math.max(1, Math.floor(startLineRaw));
@@ -734,6 +835,14 @@ export class LocalAgentRunner {
         const limit = Math.min(Math.max(toNumberValue(action.limit, 100), 1), 500);
         if (!pattern) {
           return { kind: "tool", message: "search_code failed: missing pattern.", progress: false };
+        }
+        const relevanceBlock = this.evaluateInvestigationRelevanceGuard("search_code", pattern, investigationCount);
+        if (relevanceBlock) {
+          return {
+            kind: "tool",
+            message: relevanceBlock,
+            progress: false
+          };
         }
 
         const results = await this.searchCode(pattern, limit);
@@ -1235,6 +1344,7 @@ export class LocalAgentRunner {
             "- Prefer minimal invasive change and reuse existing modules/tests.",
             "- Do not ask user for file paths.",
             "- Strictly respect task scope; do not expand a narrow test/bugfix request into project rewrite.",
+            `- Write all text fields in this language: ${this.getPreferredResponseLanguage()}.`,
             "- Keep concise and actionable."
           ].join("\n")
         },
@@ -1254,7 +1364,12 @@ export class LocalAgentRunner {
         }
       ],
       signal,
-      { temperature: 0.12, maxTokens: 1400 }
+      {
+        temperature: 0.12,
+        maxTokens: 1400,
+        thinkingEffort: this.getThinkingEffortOption(),
+        responseFormat: "json_object"
+      }
     );
 
     if (strategyResponse.usage) {
@@ -1445,6 +1560,139 @@ export class LocalAgentRunner {
     return ["write_file", "append_file", "patch_file", "run_command"].includes(type);
   }
 
+  private shouldRunResponsibilityReview(type: string): boolean {
+    if (!this.config.strictResponsibilityMode) {
+      return false;
+    }
+    return ["write_file", "append_file", "patch_file", "run_command", "complete_step", "final_answer"].includes(type);
+  }
+
+  private async reviewActionForResponsibility(
+    task: string,
+    plan: ExecutionPlan,
+    step: PlanStep,
+    action: AgentAction,
+    investigationCount: number,
+    turn: number,
+    signal?: AbortSignal
+  ): Promise<ResponsibilityReviewResult> {
+    if (!this.config.strictResponsibilityMode) {
+      return { approve: true, reason: "Responsibility mode disabled." };
+    }
+
+    try {
+      const scope = this.currentTaskScope;
+      const changedPreview = Array.from(this.changedFiles.values())
+        .slice(0, 12)
+        .join(", ");
+
+      const response = await this.client.chat(
+        [
+          {
+            role: "system",
+            content: [
+              "You are a strict responsibility reviewer for an autonomous coding agent.",
+              "Decide if proposed action is directly aligned with user objective.",
+              "Return STRICT JSON only with schema:",
+              '{ "approve": true, "reason": "string" }',
+              "Rules:",
+              "- Reject actions that drift into unrelated feature work/refactor.",
+              "- For test tasks: reject non-test implementation actions unless explicitly requested.",
+              "- Reject complete_step/final_answer if request deliverable is likely not fulfilled.",
+              "- Keep reason short and concrete.",
+              `- Use language: ${this.getPreferredResponseLanguage()}.`
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              `Global task:\n${task}`,
+              "",
+              `Plan summary: ${plan.summary}`,
+              `Current step (${step.id}): ${step.title}`,
+              `Step details: ${step.details}`,
+              "",
+              `Primary objective: ${scope?.primaryObjective ?? "Follow user request exactly."}`,
+              `Focus terms: ${(scope?.focusTerms ?? []).join(", ") || "(none)"}`,
+              `Is test task: ${scope?.isTestTask ? "yes" : "no"}`,
+              `Investigation count: ${investigationCount}`,
+              `Changed files: ${changedPreview || "(none)"}`,
+              "",
+              `Proposed action JSON:\n${JSON.stringify(action)}`,
+              "",
+              "Return JSON now."
+            ].join("\n")
+          }
+        ],
+        signal,
+        {
+          temperature: 0.05,
+          maxTokens: 220,
+          thinkingEffort: this.getThinkingEffortOption(),
+          responseFormat: "json_object"
+        }
+      );
+
+      if (response.usage) {
+        this.callbacks.onUsage?.({
+          phase: "executor",
+          stepId: step.id,
+          turn,
+          model: response.model,
+          promptTokens: response.usage.promptTokens,
+          completionTokens: response.usage.completionTokens,
+          totalTokens: response.usage.totalTokens
+        });
+      }
+
+      const parsed = extractJsonObject(response.content) as Record<string, unknown>;
+      const approveRaw = parsed.approve;
+      const approve =
+        approveRaw === true ||
+        (typeof approveRaw === "string" && ["true", "yes", "ok", "approved"].includes(approveRaw.toLowerCase()));
+      const reason = toStringValue(parsed.reason, approve ? "Approved." : "Action appears off-target.");
+
+      return {
+        approve,
+        reason
+      };
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.callbacks.onLog(`Responsibility review skipped: ${text}`);
+      return { approve: true, reason: "Review unavailable; continue with safeguards." };
+    }
+  }
+
+  private buildInvestigationSignature(type: string, action: AgentAction): string {
+    if (!this.isInvestigationAction(type)) {
+      return "";
+    }
+
+    if (type === "read_file") {
+      const path = toStringValue(action.path).trim().toLowerCase();
+      if (!path) {
+        return "read_file:";
+      }
+      const startLine = toNumberValue(action.startLine, 1);
+      const endLine = toNumberValue(action.endLine, Number.MAX_SAFE_INTEGER);
+      return `read_file:${path}:${startLine}-${endLine}`;
+    }
+
+    if (type === "search_code") {
+      const pattern = toStringValue(action.pattern).trim().toLowerCase();
+      const limit = toNumberValue(action.limit, 100);
+      return `search_code:${pattern}:${limit}`;
+    }
+
+    if (type === "list_files") {
+      const pattern = toStringValue(action.pattern, "**/*").trim().toLowerCase();
+      const limit = toNumberValue(action.limit, 500);
+      return `list_files:${pattern}:${limit}`;
+    }
+
+    return `${type}:${JSON.stringify(action)}`;
+  }
+
   private buildInvestigationGuardMessage(
     actionType: string,
     currentCount: number,
@@ -1509,6 +1757,30 @@ export class LocalAgentRunner {
       return 3200;
     }
     return Math.max(600, Math.min(8000, Math.floor(raw)));
+  }
+
+  private getThinkingEffortOption(): "low" | "medium" | "high" | undefined {
+    if (!this.config.thinkingEnabled) {
+      return undefined;
+    }
+    const raw = String(this.config.thinkingEffort || "").trim().toLowerCase();
+    if (raw === "low" || raw === "high") {
+      return raw;
+    }
+    return "medium";
+  }
+
+  private getPreferredResponseLanguage(): string {
+    const raw = (this.config.preferredLanguage || "").trim();
+    return raw.length > 0 ? raw : "Same as user request language";
+  }
+
+  private prefersVietnamese(): boolean {
+    return /vietnamese|^vi\b|tiếng việt/i.test(this.getPreferredResponseLanguage());
+  }
+
+  private t(english: string, vietnamese: string): string {
+    return this.prefersVietnamese() ? vietnamese : english;
   }
 
   private toStreamPreview(value: string, maxChars = 900): string {
@@ -2032,6 +2304,126 @@ export class LocalAgentRunner {
     ].join(" ");
   }
 
+  private evaluateInvestigationRelevanceGuard(
+    actionType: "list_files" | "search_code",
+    rawTarget: string,
+    investigationCount: number
+  ): string | undefined {
+    const scope = this.currentTaskScope;
+    if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
+      return undefined;
+    }
+    if (scope.focusTerms.length === 0) {
+      return undefined;
+    }
+    if (investigationCount < 2) {
+      return undefined;
+    }
+
+    const target = rawTarget.trim().toLowerCase();
+    if (!target) {
+      return undefined;
+    }
+    if (this.pathMatchesFocusTerms(target, scope.focusTerms)) {
+      return undefined;
+    }
+
+    if (actionType === "list_files" && this.isBroadListPattern(target)) {
+      return [
+        "ObjectiveGuard: broad list_files is off-focus now.",
+        `Task focus: ${scope.focusTerms.join(", ")}.`,
+        "List files using target-specific pattern or test folders related to requested screen/feature."
+      ].join(" ");
+    }
+
+    if (scope.isTestTask) {
+      if (/integration_test|(^|\/)test\/|(^|\/)spec\/|_test\.|\.test\./.test(target)) {
+        return undefined;
+      }
+      if (investigationCount >= 3) {
+        return [
+          `ObjectiveGuard: ${actionType} target is drifting from test objective.`,
+          `Task focus: ${scope.focusTerms.join(", ")}.`,
+          "Search/list in related test files or focus module names only."
+        ].join(" ");
+      }
+      return undefined;
+    }
+
+    if (investigationCount >= 3) {
+      return [
+        `ObjectiveGuard: ${actionType} target is not aligned with requested module.`,
+        `Task focus: ${scope.focusTerms.join(", ")}.`,
+        "Use focused path/query terms from user request."
+      ].join(" ");
+    }
+
+    return undefined;
+  }
+
+  private evaluateReadRelevanceGuard(relPath: string, investigationCount: number): string | undefined {
+    const scope = this.currentTaskScope;
+    if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
+      return undefined;
+    }
+    if (scope.focusTerms.length === 0 || investigationCount < 2) {
+      return undefined;
+    }
+
+    const lowerPath = relPath.toLowerCase();
+    if (this.pathMatchesFocusTerms(lowerPath, scope.focusTerms)) {
+      return undefined;
+    }
+    if (this.isContextBootstrapFile(lowerPath)) {
+      return undefined;
+    }
+
+    if (scope.isTestTask) {
+      const readsTestStructure =
+        this.isLikelyTestFile(lowerPath) || lowerPath.startsWith("integration_test/") || lowerPath.startsWith("test/");
+      if (readsTestStructure && investigationCount < 4) {
+        return undefined;
+      }
+      return [
+        `ObjectiveGuard: read_file '${relPath}' is drifting from requested test target.`,
+        `Focus terms: ${scope.focusTerms.join(", ")}.`,
+        "Read the closest source/test files matching target screen/feature."
+      ].join(" ");
+    }
+
+    if (investigationCount >= 4) {
+      return [
+        `ObjectiveGuard: read_file '${relPath}' is outside current objective focus.`,
+        `Focus terms: ${scope.focusTerms.join(", ")}.`,
+        "Read files that directly match the requested module."
+      ].join(" ");
+    }
+
+    return undefined;
+  }
+
+  private isContextBootstrapFile(relativePathLower: string): boolean {
+    const fileName = path.posix.basename(relativePathLower);
+    const bootstrapNames = new Set([
+      "readme.md",
+      "package.json",
+      "tsconfig.json",
+      "pubspec.yaml",
+      "analysis_options.yaml",
+      "pyproject.toml",
+      "go.mod",
+      "cargo.toml"
+    ]);
+    if (bootstrapNames.has(fileName)) {
+      return true;
+    }
+    return (
+      relativePathLower === "src/extension.ts" ||
+      relativePathLower === "src/index.ts" ||
+      relativePathLower.startsWith(".vscode/")
+    );
+  }
+
   private taskExplicitlyAllowsFrameworkAccess(): boolean {
     const text = this.currentTaskScope?.rawTask?.toLowerCase() ?? "";
     if (!text) {
@@ -2311,7 +2703,9 @@ export class LocalAgentRunner {
     }
 
     const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "explicit modules from the request";
+    const primaryObjective = this.buildPrimaryObjective(primaryTask, isTestTask, focusTerms);
     const contract = [
+      `- Primary objective: ${primaryObjective}`,
       `- Scope class: ${scopeClass}.`,
       `- Maximum changed files target: ${maxChangedFiles}.`,
       allowRewrite
@@ -2331,8 +2725,17 @@ export class LocalAgentRunner {
       allowRewrite,
       maxChangedFiles,
       focusTerms,
+      primaryObjective,
       contract
     };
+  }
+
+  private buildPrimaryObjective(primaryTask: string, isTestTask: boolean, focusTerms: string[]): string {
+    const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "requested target";
+    if (isTestTask) {
+      return `Write/update tests only for ${focusLabel}. Do not implement or refactor unrelated product features.`;
+    }
+    return `Implement exactly: ${primaryTask.trim()}. Keep changes limited to ${focusLabel}.`;
   }
 
   private extractPrimaryTaskText(task: string): string {
@@ -2622,16 +3025,23 @@ export class LocalAgentRunner {
         ].join(" ");
       }
 
-      if (!existsBeforeWrite) {
-        const relatedTestFiles = await this.findRelatedExistingTestFiles(scope.focusTerms, 6);
-        if (
-          relatedTestFiles.length > 0 &&
-          !relatedTestFiles.includes(relPath) &&
-          !relatedTestFiles.some((candidate) => this.isSiblingPath(relPath, candidate))
-        ) {
+      const relatedTestFiles = await this.findRelatedExistingTestFiles(scope.focusTerms, 6);
+      if (
+        relatedTestFiles.length > 0 &&
+        !relatedTestFiles.includes(relPath) &&
+        !relatedTestFiles.some((candidate) => this.isSiblingPath(relPath, candidate))
+      ) {
+        if (!existsBeforeWrite) {
           return [
             `ReuseGuard: existing related test file(s) found: ${relatedTestFiles.join(", ")}.`,
             `Avoid creating unrelated new test file '${relPath}'. Update the closest existing test file first.`
+          ].join(" ");
+        }
+        if (!touchesFocus) {
+          return [
+            `ObjectiveGuard: updating '${relPath}' is off-target for this test request.`,
+            `Closest related test file(s): ${relatedTestFiles.join(", ")}.`,
+            "Update the related test file instead of unrelated test areas."
           ].join(" ");
         }
       }

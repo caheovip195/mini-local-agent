@@ -8,7 +8,7 @@ import type {
   ExecutionPlan,
   StepStatus
 } from "./agent/types";
-import { LmStudioClient } from "./lmStudioClient";
+import { LmStudioClient, type ThinkingEffort } from "./lmStudioClient";
 import { LocalInlineCompletionProvider } from "./inlineCompletion";
 
 interface RunMode {
@@ -107,6 +107,11 @@ interface UsageTotals {
   total: number;
 }
 
+interface ThinkingSettings {
+  enabled: boolean;
+  effort: ThinkingEffort;
+}
+
 interface RemainingStepEntry {
   id: string;
   title: string;
@@ -145,7 +150,7 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.22 activated");
+  output.appendLine("Local Agent Coder v0.0.33 activated");
   const provider = new LocalAgentViewProvider(context, output);
   const inlineProvider = new LocalInlineCompletionProvider(output);
 
@@ -228,56 +233,84 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       const type = payload.type;
       this.output.appendLine(`webview message type=${String(type)}`);
 
-      if (type === "webview_ready") {
-        this.webviewReady = true;
-        this.output.appendLine("webview ready");
-        this.flushPendingEvents();
-        return;
-      }
-
-      if (type === "run") {
-        const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
-        const mode = payload.mode === "plan" ? "plan" : "agent";
-        const model = typeof payload.model === "string" ? payload.model.trim() : "";
-        const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl.trim() : "";
-
-        if (!prompt) {
-          this.post({ type: "error", text: "Prompt is required." });
+      switch (type) {
+        case "webview_ready": {
+          this.webviewReady = true;
+          this.output.appendLine("webview ready");
+          this.flushPendingEvents();
           return;
         }
 
-        await this.run(prompt, { type: mode }, model, baseUrl);
-      }
+        case "run": {
+          const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+          const mode = payload.mode === "plan" ? "plan" : "agent";
+          const model = typeof payload.model === "string" ? payload.model.trim() : "";
+          const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl.trim() : "";
+          const thinkingEnabled =
+            typeof payload.thinkingEnabled === "boolean" ? payload.thinkingEnabled : undefined;
+          const thinkingEffortRaw = typeof payload.thinkingEffort === "string" ? payload.thinkingEffort : undefined;
+          const thinkingEffort = thinkingEffortRaw ? this.normalizeThinkingEffort(thinkingEffortRaw) : undefined;
 
-      if (type === "stop") {
-        this.abortController?.abort();
-      }
+          this.output.appendLine(
+            `run request mode=${mode} model=${model || "-"} baseUrl=${baseUrl || "-"} thinking=${thinkingEnabled === true ? thinkingEffort || "medium" : "off"} promptChars=${prompt.length}`
+          );
 
-      if (type === "load_models") {
-        const preferredModel = typeof payload.preferredModel === "string" ? payload.preferredModel : undefined;
-        const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl : undefined;
-        this.output.appendLine(
-          `load_models request preferred=${preferredModel || "-"} baseUrl=${(baseUrl || "").trim() || "-"}`
-        );
-        await this.loadModels(preferredModel, baseUrl);
-      }
+          if (!prompt) {
+            this.post({ type: "error", text: "Prompt is required." });
+            return;
+          }
 
-      if (type === "load_history") {
-        this.postHistory();
-      }
+          await this.run(prompt, { type: mode }, model, baseUrl, thinkingEnabled, thinkingEffort);
+          return;
+        }
 
-      if (type === "clear_session") {
-        this.clearSession();
-      }
+        case "stop": {
+          this.abortController?.abort();
+          return;
+        }
 
-      if (type === "client_error") {
-        const text = typeof payload.text === "string" ? payload.text : "Unknown webview error.";
-        this.output.appendLine(`Webview error: ${text}`);
-      }
+        case "load_models": {
+          if (this.running) {
+            this.output.appendLine("load_models ignored: agent run is in progress.");
+            this.post({
+              type: "status",
+              text: "Đang chạy agent, tạm thời không reload models."
+            });
+            return;
+          }
+          const preferredModel = typeof payload.preferredModel === "string" ? payload.preferredModel : undefined;
+          const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl : undefined;
+          this.output.appendLine(
+            `load_models request preferred=${preferredModel || "-"} baseUrl=${(baseUrl || "").trim() || "-"}`
+          );
+          await this.loadModels(preferredModel, baseUrl);
+          return;
+        }
 
-      if (type === "client_trace") {
-        const text = typeof payload.text === "string" ? payload.text : "webview trace";
-        this.output.appendLine(`Webview trace: ${text}`);
+        case "load_history": {
+          this.postHistory();
+          return;
+        }
+
+        case "clear_session": {
+          this.clearSession();
+          return;
+        }
+
+        case "client_error": {
+          const text = typeof payload.text === "string" ? payload.text : "Unknown webview error.";
+          this.output.appendLine(`Webview error: ${text}`);
+          return;
+        }
+
+        case "client_trace": {
+          const text = typeof payload.text === "string" ? payload.text : "webview trace";
+          this.output.appendLine(`Webview trace: ${text}`);
+          return;
+        }
+
+        default:
+          return;
       }
     });
 
@@ -348,7 +381,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     prompt: string,
     mode: RunMode,
     modelOverride?: string,
-    baseUrlOverride?: string
+    baseUrlOverride?: string,
+    thinkingEnabledOverride?: boolean,
+    thinkingEffortOverride?: ThinkingEffort
   ): Promise<void> {
     if (this.running) {
       this.post({ type: "error", text: "Another task is already running." });
@@ -372,19 +407,34 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
     const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : lmSettings.model;
     const selectedBaseUrl = this.normalizeBaseUrl(baseUrlOverride || lmSettings.baseUrl, lmSettings.baseUrl);
+    const defaultThinking = this.readThinkingSettings();
+    const selectedThinkingEnabled =
+      typeof thinkingEnabledOverride === "boolean" ? thinkingEnabledOverride : defaultThinking.enabled;
+    const selectedThinkingEffort = this.normalizeThinkingEffort(thinkingEffortOverride ?? defaultThinking.effort);
+    const preferredLanguage = this.toLanguageLabel(this.detectPreferredLanguage(prompt));
 
-    const config = this.readConfig(workspace.uri.fsPath, {
-      ...lmSettings,
-      baseUrl: selectedBaseUrl,
-      model: selectedModel
-    });
+    const config = this.readConfig(
+      workspace.uri.fsPath,
+      {
+        ...lmSettings,
+        baseUrl: selectedBaseUrl,
+        model: selectedModel
+      },
+      preferredLanguage,
+      {
+        enabled: selectedThinkingEnabled,
+        effort: selectedThinkingEffort
+      }
+    );
 
     await this.persistLmSelection(selectedModel, selectedBaseUrl);
+    await this.persistThinkingSelection(selectedThinkingEnabled, selectedThinkingEffort);
 
     this.output.appendLine(`Task mode=${mode.type}`);
     this.output.appendLine(`Provider=${lmSettings.providerName}`);
     this.output.appendLine(`Model=${selectedModel}`);
     this.output.appendLine(`BaseURL=${selectedBaseUrl}`);
+    this.output.appendLine(`Thinking=${selectedThinkingEnabled ? selectedThinkingEffort : "off"}`);
     this.output.appendLine(`Prompt: ${prompt}`);
 
     this.running = true;
@@ -393,7 +443,17 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     this.post({ type: "run_context", mode: mode.type, model: selectedModel });
     this.post({ type: "running", value: true });
-    this.post({ type: "status", text: mode.type === "plan" ? "Planning..." : "Planning + executing..." });
+    this.post({
+      type: "status",
+      text:
+        preferredLanguage === "Vietnamese"
+          ? mode.type === "plan"
+            ? "Đang lập kế hoạch..."
+            : "Đang lập kế hoạch và thực thi..."
+          : mode.type === "plan"
+            ? "Planning..."
+            : "Planning + executing..."
+    });
 
     const client = new LmStudioClient({
       providerName: config.providerName,
@@ -413,6 +473,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     let runStatus: ConversationHistoryEntry["status"] = "done";
     let latestPlan: ExecutionPlan | undefined;
     const stepStatuses = new Map<string, StepStatus>();
+    const thinkingEffortForChat: ThinkingEffort | undefined = selectedThinkingEnabled ? selectedThinkingEffort : undefined;
 
     const runner = new LocalAgentRunner(client, config.agentConfig, {
       onLog: (message) => {
@@ -481,7 +542,14 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     try {
       this.post({ type: "status", text: "Summarizing conversation memory..." });
-      const preflight = await this.buildPreflightTask(client, prompt, mode, this.abortController.signal);
+      const preflight = await this.buildPreflightTask(
+        client,
+        prompt,
+        mode,
+        this.abortController.signal,
+        preferredLanguage,
+        thinkingEffortForChat
+      );
       preflightSummary = preflight.preflightSummary;
       this.output.appendLine(`Preflight summary: ${preflightSummary}`);
       this.post({ type: "log", text: `Preflight summary:\n${preflightSummary}` });
@@ -515,7 +583,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
             runSummary: executionSummary,
             status: runStatus,
             remainingSteps
-          });
+          }, preferredLanguage, thinkingEffortForChat);
           learningNote = learning.lesson;
           await this.appendLearningMemory({
             id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
@@ -555,7 +623,6 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       this.running = false;
       this.abortController = undefined;
       this.post({ type: "running", value: false });
-      void this.loadModels(selectedModel, selectedBaseUrl);
     }
   }
 
@@ -609,7 +676,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     client: LmStudioClient,
     prompt: string,
     mode: RunMode,
-    signal: AbortSignal
+    signal: AbortSignal,
+    preferredLanguage: string,
+    thinkingEffort?: ThinkingEffort
   ): Promise<{ compactTask: string; preflightSummary: string }> {
     const sessionHistory = this.getActiveSessionHistoryEntries();
     const unfinishedEntry = this.getMostRecentUnfinishedEntry(sessionHistory);
@@ -662,11 +731,15 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     if (!hasRelatedHistory && !continuationIntent) {
       const executionBrief =
-        "No related prior conversation detected. Use only current request. Investigate workspace first, then execute without loops.";
+        preferredLanguage === "Vietnamese"
+          ? "Không có hội thoại liên quan trước đó. Chỉ dùng yêu cầu hiện tại. Hãy đọc workspace trước rồi thực thi, tránh vòng lặp."
+          : "No related prior conversation detected. Use only current request. Investigate workspace first, then execute without loops.";
       const preflightSummary = [
-        "Conversation: (No related prior context used.)",
-        `Current: ${prompt}`,
-        `Brief: ${executionBrief}`
+        preferredLanguage === "Vietnamese"
+          ? "Hội thoại: (Không dùng ngữ cảnh trước đó liên quan.)"
+          : "Conversation: (No related prior context used.)",
+        preferredLanguage === "Vietnamese" ? `Yêu cầu hiện tại: ${prompt}` : `Current: ${prompt}`,
+        preferredLanguage === "Vietnamese" ? `Tóm tắt thực thi: ${executionBrief}` : `Brief: ${executionBrief}`
       ].join("\n");
 
       const compactTask = [
@@ -696,7 +769,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
             "- Keep concise.",
             "- Mention only facts from history and current request.",
             "- Keep anti-loop and anti-stall mindset in execution_brief.",
-            "- If the user asks to continue unfinished work, prioritize unresolved steps from history."
+            "- If the user asks to continue unfinished work, prioritize unresolved steps from history.",
+            `- Write all fields in this language: ${preferredLanguage}.`
           ].join("\n")
         },
         {
@@ -721,7 +795,12 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         }
       ],
       signal,
-      { temperature: 0.1, maxTokens: 700 }
+      {
+        temperature: 0.1,
+        maxTokens: 700,
+        thinkingEffort,
+        responseFormat: "json_object"
+      }
     );
 
     if (preflightResponse.usage) {
@@ -744,12 +823,17 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       currentRequest = this.toText(parsed.current_request, prompt);
       executionBrief = this.toText(
         parsed.execution_brief,
-        "Investigate workspace first, then execute without unnecessary questions."
+        preferredLanguage === "Vietnamese"
+          ? "Hãy đọc workspace trước, sau đó thực thi mà không hỏi dư thừa."
+          : "Investigate workspace first, then execute without unnecessary questions."
       );
     } catch {
       conversationSummary = this.trimForPrompt(preflightResponse.content, 700);
       currentRequest = prompt;
-      executionBrief = "Investigate first and execute with minimal loops.";
+      executionBrief =
+        preferredLanguage === "Vietnamese"
+          ? "Ưu tiên điều tra trước và thực thi với vòng lặp tối thiểu."
+          : "Investigate first and execute with minimal loops.";
     }
 
     if (continuationIntent && unfinishedEntry && unfinishedEntry.remainingSteps.length > 0) {
@@ -764,21 +848,38 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
       executionBrief = [
         executionBrief,
-        "Start from remaining steps of unfinished run.",
-        "Do not restart from scratch if steps are already done."
+        preferredLanguage === "Vietnamese"
+          ? "Bắt đầu từ các bước còn dang dở của lần chạy trước."
+          : "Start from remaining steps of unfinished run.",
+        preferredLanguage === "Vietnamese"
+          ? "Không làm lại từ đầu nếu các bước trước đã hoàn thành."
+          : "Do not restart from scratch if steps are already done."
       ].join(" ");
     }
 
     if (learningRules.length > 0) {
-      executionBrief = `${executionBrief} Apply project learning rules from memory.`;
+      executionBrief =
+        preferredLanguage === "Vietnamese"
+          ? `${executionBrief} Áp dụng các quy tắc rút ra từ lịch sử dự án.`
+          : `${executionBrief} Apply project learning rules from memory.`;
     }
 
     const preflightSummary = [
-      `Conversation: ${conversationSummary}`,
-      `Current: ${currentRequest}`,
-      `Brief: ${executionBrief}`,
-      learningRules.length > 0 ? `Rules: ${learningRules.join(" | ")}` : "",
-      continuationIntent && unfinishedEntry ? `Continuation source: ${unfinishedEntry.timestamp}` : ""
+      preferredLanguage === "Vietnamese"
+        ? `Hội thoại: ${conversationSummary}`
+        : `Conversation: ${conversationSummary}`,
+      preferredLanguage === "Vietnamese" ? `Yêu cầu hiện tại: ${currentRequest}` : `Current: ${currentRequest}`,
+      preferredLanguage === "Vietnamese" ? `Tóm tắt thực thi: ${executionBrief}` : `Brief: ${executionBrief}`,
+      learningRules.length > 0
+        ? preferredLanguage === "Vietnamese"
+          ? `Quy tắc: ${learningRules.join(" | ")}`
+          : `Rules: ${learningRules.join(" | ")}`
+        : "",
+      continuationIntent && unfinishedEntry
+        ? preferredLanguage === "Vietnamese"
+          ? `Nguồn tiếp tục: ${unfinishedEntry.timestamp}`
+          : `Continuation source: ${unfinishedEntry.timestamp}`
+        : ""
     ]
       .filter(Boolean)
       .join("\n")
@@ -1059,6 +1160,22 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
+  private detectPreferredLanguage(prompt: string): "vi" | "en" {
+    const text = prompt.toLowerCase();
+    const vietnameseChars =
+      /[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/i;
+    const vietnameseWords =
+      /\b(tôi|mình|bạn|không|được|giúp|làm|viết|sửa|tiếp|dùng|cần|đang|màn|phần|lỗi|đúng|sai)\b/i;
+    if (vietnameseChars.test(prompt) || vietnameseWords.test(text)) {
+      return "vi";
+    }
+    return "en";
+  }
+
+  private toLanguageLabel(code: "vi" | "en"): string {
+    return code === "vi" ? "Vietnamese" : "English";
+  }
+
   private async buildLearningNote(
     client: LmStudioClient,
     input: {
@@ -1067,7 +1184,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       runSummary: string;
       status: "done" | "error" | "cancelled";
       remainingSteps: RemainingStepEntry[];
-    }
+    },
+    preferredLanguage: string,
+    thinkingEffort?: ThinkingEffort
   ): Promise<{ lesson: string; rules: string[] }> {
     const remainingBlock =
       input.remainingSteps.length > 0 ? this.formatRemainingSteps(input.remainingSteps, 6) : "(none)";
@@ -1082,7 +1201,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
             "Rules:",
             "- Keep lesson practical and short.",
             "- Rules must be concrete, reusable for the same project.",
-            "- Focus on architecture fit, anti-loop behavior, and execution quality."
+            "- Focus on architecture fit, anti-loop behavior, and execution quality.",
+            `- Write lesson and rules in this language: ${preferredLanguage}.`
           ].join("\n")
         },
         {
@@ -1105,7 +1225,12 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         }
       ],
       undefined,
-      { temperature: 0.1, maxTokens: 260 }
+      {
+        temperature: 0.1,
+        maxTokens: 260,
+        thinkingEffort,
+        responseFormat: "json_object"
+      }
     );
 
     if (response.usage) {
@@ -1247,7 +1372,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   private async persistLmSelection(model: string, baseUrl: string): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("localAgent");
     const updates: Array<Thenable<unknown>> = [];
-    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
+    const preset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
+    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false) && preset === "openrouter";
 
     if (model.trim()) {
       updates.push(cfg.update("lmStudio.model", model, vscode.ConfigurationTarget.Workspace));
@@ -1268,6 +1394,18 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     try {
       await Promise.all(updates);
+    } catch {
+      // Ignore config update errors and continue run.
+    }
+  }
+
+  private async persistThinkingSelection(enabled: boolean, effort: ThinkingEffort): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    try {
+      await Promise.all([
+        cfg.update("thinking.enabled", enabled, vscode.ConfigurationTarget.Workspace),
+        cfg.update("thinking.effort", this.normalizeThinkingEffort(effort), vscode.ConfigurationTarget.Workspace)
+      ]);
     } catch {
       // Ignore config update errors and continue run.
     }
@@ -1422,7 +1560,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
     const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
     const legacyModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
-    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
+    const quickOpenRouterConfigured = cfg.get<boolean>("openRouter.simpleMode", false);
     const quickOpenRouterApiKey = cfg.get<string>("openRouter.apiKey", "").trim();
     const quickOpenRouterModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim();
     const quickOpenRouterSiteUrl = cfg.get<string>("openRouter.siteUrl", "").trim();
@@ -1431,7 +1569,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const rawPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
     const configuredPreset: LmSettings["providerPreset"] =
       rawPreset === "openrouter" || rawPreset === "custom" ? rawPreset : "lmstudio";
-    const providerPreset: LmSettings["providerPreset"] = quickOpenRouter ? "openrouter" : configuredPreset;
+    const providerPreset: LmSettings["providerPreset"] = configuredPreset;
+    const quickOpenRouter = quickOpenRouterConfigured && providerPreset === "openrouter";
 
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
     const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
@@ -1443,26 +1582,37 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     );
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
 
-    const baseDefault = providerPreset === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : legacyBaseUrl;
-    const baseUrl = quickOpenRouter
-      ? DEFAULT_OPENROUTER_BASE_URL
-      : providerBaseUrl.length > 0
-        ? providerBaseUrl
-        : baseDefault;
-    const apiKey = quickOpenRouter
-      ? quickOpenRouterApiKey || providerApiKey || legacyApiKey
-      : providerApiKey.length > 0
-        ? providerApiKey
-        : legacyApiKey;
-    const model = quickOpenRouter
-      ? quickOpenRouterModel || providerModel || legacyModel
-      : providerModel.length > 0
-        ? providerModel
-        : legacyModel;
-    const modelsPath = quickOpenRouter ? "/models" : providerModelsPath;
-    const chatPath = quickOpenRouter ? "/chat/completions" : providerChatPath;
+    let baseUrl = legacyBaseUrl;
+    let apiKey = legacyApiKey;
+    let model = legacyModel;
+    let modelsPath = "/models";
+    let chatPath = "/chat/completions";
+    let headers: Record<string, string> = {};
 
-    const headers: Record<string, string> = { ...extraHeaders };
+    if (providerPreset === "openrouter") {
+      baseUrl = quickOpenRouter
+        ? DEFAULT_OPENROUTER_BASE_URL
+        : providerBaseUrl.length > 0
+          ? providerBaseUrl
+          : DEFAULT_OPENROUTER_BASE_URL;
+      apiKey = quickOpenRouter
+        ? quickOpenRouterApiKey || providerApiKey || legacyApiKey
+        : providerApiKey || quickOpenRouterApiKey || legacyApiKey;
+      model = quickOpenRouter
+        ? quickOpenRouterModel || providerModel || legacyModel
+        : providerModel || quickOpenRouterModel || legacyModel;
+      modelsPath = quickOpenRouter ? "/models" : providerModelsPath;
+      chatPath = quickOpenRouter ? "/chat/completions" : providerChatPath;
+      headers = { ...extraHeaders };
+    } else if (providerPreset === "custom") {
+      baseUrl = providerBaseUrl.length > 0 ? providerBaseUrl : legacyBaseUrl;
+      apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+      model = providerModel.length > 0 ? providerModel : legacyModel;
+      modelsPath = providerModelsPath;
+      chatPath = providerChatPath;
+      headers = { ...extraHeaders };
+    }
+
     if (providerPreset === "openrouter") {
       const configuredSiteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
       const configuredAppName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
@@ -1498,7 +1648,27 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private readConfig(workspaceRoot: string, lm: LmSettings): {
+  private normalizeThinkingEffort(value: unknown): ThinkingEffort {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (raw === "low" || raw === "high") {
+      return raw;
+    }
+    return "medium";
+  }
+
+  private readThinkingSettings(): ThinkingSettings {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    const enabled = cfg.get<boolean>("thinking.enabled", false);
+    const effort = this.normalizeThinkingEffort(cfg.get<string>("thinking.effort", "medium"));
+    return { enabled, effort };
+  }
+
+  private readConfig(
+    workspaceRoot: string,
+    lm: LmSettings,
+    preferredLanguage: string,
+    thinking?: ThinkingSettings
+  ): {
     providerName: string;
     baseUrl: string;
     apiKey: string;
@@ -1509,6 +1679,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     agentConfig: AgentConfig;
   } {
     const cfg = vscode.workspace.getConfiguration("localAgent");
+    const thinkingSettings = thinking ?? this.readThinkingSettings();
 
     return {
       providerName: lm.providerName,
@@ -1520,6 +1691,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       headers: lm.headers,
       agentConfig: {
         workspaceRoot,
+        preferredLanguage,
+        thinkingEnabled: thinkingSettings.enabled,
+        thinkingEffort: thinkingSettings.effort,
+        strictResponsibilityMode: cfg.get<boolean>("strictResponsibilityMode", true),
         maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 10),
         executorMaxTokens: cfg.get<number>("executorMaxTokens", 3200),
         maxAskUser: cfg.get<number>("maxAskUser", 0),
@@ -1570,6 +1745,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
   private getHtml(): string {
     const nonce = createNonce();
+    const thinking = this.readThinkingSettings();
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1580,139 +1756,253 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   <title>Local Agent</title>
   <style>
     :root {
-      --bg: #f3f7f4;
-      --ink: #172126;
-      --muted: #587178;
-      --line: #cfddcf;
-      --panel: #ffffff;
-      --accent: #0c8c72;
-      --accent-strong: #066d59;
-      --warn: #d98e2f;
-      --bad: #c75050;
-      --ok: #17845f;
-      --chip: #e9f4ef;
+      --bg-0: #0f1c22;
+      --bg-1: #122933;
+      --card: rgba(14, 28, 36, 0.76);
+      --card-strong: rgba(10, 22, 30, 0.9);
+      --line: rgba(127, 182, 168, 0.26);
+      --line-strong: rgba(127, 182, 168, 0.45);
+      --text: #eaf7f3;
+      --text-soft: #9bc4b8;
+      --accent: #4bd7ab;
+      --accent-2: #2cb88e;
+      --warn: #f0ae5a;
+      --danger: #ef7b7b;
+      --ok: #5cda9f;
+      --shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
     }
 
     body {
       margin: 0;
       padding: 12px;
-      color: var(--ink);
-      background: radial-gradient(circle at 0% 0%, #d8eee6 0%, var(--bg) 45%), linear-gradient(150deg, #f3f7f4 0%, #eef7f2 100%);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% -10%, #1f4f53 0%, transparent 35%),
+        radial-gradient(circle at 95% 5%, #153b4f 0%, transparent 28%),
+        linear-gradient(160deg, var(--bg-0) 0%, var(--bg-1) 100%);
       font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
       font-size: 12px;
       line-height: 1.5;
+      min-height: 100%;
+      overflow: auto;
+    }
+
+    .app {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
 
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-      gap: 10px;
+      grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.9fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .col-main {
+      min-width: 0;
+    }
+
+    .col-side {
+      min-width: 0;
     }
 
     .panel {
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: var(--panel);
-      padding: 10px;
-      box-shadow: 0 6px 24px rgba(20, 40, 32, 0.08);
-      margin-bottom: 10px;
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(21, 39, 47, 0.92) 0%, var(--card) 100%);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .panel.hero {
+      background: linear-gradient(155deg, rgba(19, 44, 52, 0.95) 0%, rgba(9, 23, 30, 0.95) 100%);
+      border-color: var(--line-strong);
     }
 
     .header {
       display: flex;
       justify-content: space-between;
-      align-items: baseline;
-      gap: 8px;
-      margin-bottom: 6px;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
     }
 
     .title {
       font-size: 14px;
       font-weight: 700;
       letter-spacing: 0.2px;
+      color: #f3fffc;
     }
 
     .hint {
-      color: var(--muted);
+      color: var(--text-soft);
       font-size: 11px;
+      line-height: 1.45;
     }
 
     .status-pill {
       display: inline-flex;
       align-items: center;
-      border: 1px solid var(--line);
-      background: #eef6f1;
-      color: #244c43;
-      padding: 3px 8px;
+      gap: 6px;
+      border: 1px solid rgba(127, 182, 168, 0.42);
+      background: rgba(35, 78, 75, 0.4);
+      color: #dffff3;
+      padding: 4px 10px;
       border-radius: 999px;
-      font-weight: 600;
+      font-weight: 700;
       max-width: 100%;
       white-space: nowrap;
       text-overflow: ellipsis;
       overflow: hidden;
     }
 
+    .fields {
+      display: grid;
+      gap: 8px;
+    }
+
     .row {
       display: flex;
       gap: 8px;
-      margin-top: 8px;
       align-items: center;
       flex-wrap: wrap;
     }
 
     .grow {
       flex: 1;
-      min-width: 180px;
+      min-width: 150px;
+    }
+
+    .control-label {
+      color: var(--text-soft);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.45px;
+      margin-bottom: 4px;
     }
 
     textarea, select, input, button {
       font: inherit;
     }
 
-    textarea {
+    textarea,
+    select,
+    input[type="text"] {
       width: 100%;
-      min-height: 100px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 10px;
-      box-sizing: border-box;
-      background: #fbfefd;
-      color: var(--ink);
+      border: 1px solid rgba(129, 186, 171, 0.35);
+      border-radius: 12px;
+      background: rgba(5, 14, 20, 0.44);
+      color: #ecfffa;
+      transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
     }
 
-    select, input[type="text"] {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px;
-      background: #fbfefd;
-      color: var(--ink);
+    textarea:focus,
+    select:focus,
+    input[type="text"]:focus {
+      outline: none;
+      border-color: rgba(94, 216, 176, 0.86);
+      box-shadow: 0 0 0 3px rgba(56, 186, 146, 0.18);
+      background: rgba(5, 14, 20, 0.62);
+    }
+
+    select,
+    input[type="text"] {
+      padding: 9px 10px;
+      min-height: 36px;
+    }
+
+    textarea {
+      min-height: 128px;
+      resize: vertical;
+      padding: 11px 12px;
+      line-height: 1.5;
+    }
+
+    textarea::placeholder,
+    input::placeholder {
+      color: rgba(164, 199, 189, 0.75);
+    }
+
+    .task-actions {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
     }
 
     button {
-      border: 0;
-      border-radius: 10px;
-      padding: 8px 11px;
-      background: #dbeae2;
-      color: #1f3b35;
+      border: 1px solid rgba(132, 190, 174, 0.3);
+      border-radius: 12px;
+      padding: 9px 10px;
+      background: rgba(28, 55, 59, 0.66);
+      color: #e8fff8;
       cursor: pointer;
-      font-weight: 600;
+      font-weight: 700;
+      transition: transform 100ms ease, border-color 120ms ease, background 120ms ease;
+    }
+
+    button:hover {
+      border-color: rgba(124, 210, 181, 0.64);
+      background: rgba(36, 74, 78, 0.78);
+      transform: translateY(-1px);
     }
 
     button.primary {
-      background: var(--accent);
-      color: #f5fffc;
+      border-color: rgba(76, 229, 181, 0.68);
+      background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 100%);
+      color: #03241b;
     }
 
     button.warn {
-      background: #f6d9d9;
-      color: #7a2f2f;
+      border-color: rgba(239, 123, 123, 0.58);
+      background: rgba(103, 36, 44, 0.75);
+      color: #ffe7e7;
     }
 
     button:disabled {
       cursor: not-allowed;
-      opacity: 0.55;
+      opacity: 0.5;
+      transform: none;
+    }
+
+    .toggle-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(130, 186, 171, 0.35);
+      background: rgba(8, 20, 25, 0.48);
+      color: #d7f4eb;
+      min-height: 36px;
+    }
+
+    .toggle-wrap input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      accent-color: var(--accent);
+      margin: 0;
     }
 
     .meta-grid {
@@ -1722,76 +2012,95 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     .metric {
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #fbfefd;
-      padding: 8px;
+      border: 1px solid rgba(129, 186, 171, 0.3);
+      border-radius: 12px;
+      background: rgba(8, 20, 25, 0.5);
+      padding: 9px;
     }
 
     .metric .k {
-      color: var(--muted);
+      color: var(--text-soft);
       font-size: 10px;
       text-transform: uppercase;
       letter-spacing: 0.4px;
     }
 
     .metric .v {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 700;
       margin-top: 2px;
+      color: #f1fffb;
     }
 
     .progress {
-      margin-top: 7px;
-      border: 1px solid var(--line);
+      border: 1px solid rgba(129, 186, 171, 0.32);
       border-radius: 999px;
-      height: 8px;
+      height: 10px;
       overflow: hidden;
-      background: #f0f5f1;
+      background: rgba(8, 20, 25, 0.56);
     }
 
     .progress > div {
       height: 100%;
       width: 0%;
-      background: linear-gradient(90deg, var(--accent) 0%, #4ec0a5 100%);
-      transition: width 120ms ease;
+      background: linear-gradient(90deg, #41d9a9 0%, #6dd4f6 100%);
+      transition: width 130ms ease;
+    }
+
+    .list,
+    .activity,
+    .logs {
+      overflow: auto;
+      border: 1px solid rgba(129, 186, 171, 0.28);
+      border-radius: 12px;
+      background: rgba(6, 16, 21, 0.5);
+      padding: 8px;
+      max-height: min(42vh, 420px);
     }
 
     .list {
       list-style: none;
-      padding: 0;
       margin: 0;
-      max-height: 260px;
-      overflow: auto;
       display: grid;
-      gap: 6px;
+      gap: 7px;
     }
 
-    .item {
-      border: 1px solid var(--line);
-      border-radius: 10px;
+    .activity {
+      display: grid;
+      gap: 7px;
+    }
+
+    .item,
+    .activity-card {
+      border: 1px solid rgba(129, 186, 171, 0.26);
+      border-radius: 11px;
       padding: 8px;
-      background: #fbfefd;
+      background: rgba(15, 33, 39, 0.74);
       white-space: pre-wrap;
       word-break: break-word;
     }
 
-    .item[data-status="in_progress"] { border-color: #f2cb95; background: #fff8ef; }
-    .item[data-status="done"] { border-color: #9bd3b8; background: #f0fbf4; }
-    .item[data-status="failed"] { border-color: #e8a2a2; background: #fff2f2; }
-
-    .activity {
-      max-height: 260px;
-      overflow: auto;
-      display: grid;
-      gap: 6px;
+    .item[data-status="in_progress"] {
+      border-color: rgba(240, 174, 90, 0.76);
+      background: rgba(80, 58, 21, 0.45);
     }
 
-    .activity-card {
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px;
-      background: #fbfefd;
+    .item[data-status="done"] {
+      border-color: rgba(92, 218, 159, 0.7);
+      background: rgba(20, 64, 48, 0.48);
+    }
+
+    .item[data-status="failed"] {
+      border-color: rgba(239, 123, 123, 0.7);
+      background: rgba(86, 34, 43, 0.46);
+    }
+
+    .activity-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
     }
 
     .history-row {
@@ -1800,50 +2109,22 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       gap: 8px;
       align-items: center;
       margin-bottom: 6px;
+      flex-wrap: wrap;
     }
 
     .history-meta {
-      color: var(--muted);
+      color: var(--text-soft);
       font-size: 10px;
     }
 
     .history-btn {
-      border: 1px solid var(--line);
-      background: #eef6f1;
-      color: #234941;
-      border-radius: 8px;
+      border: 1px solid rgba(129, 186, 171, 0.45);
+      background: rgba(33, 75, 72, 0.64);
+      color: #e1fff5;
+      border-radius: 9px;
       font-size: 11px;
-      padding: 4px 8px;
-    }
-
-    .model-tags {
-      margin-top: 6px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-
-    .model-tag {
-      border: 1px solid var(--line);
-      background: #eef6f1;
-      color: #234941;
-      border-radius: 999px;
-      font-size: 11px;
-      padding: 3px 8px;
-      cursor: pointer;
-    }
-
-    .model-tag.active {
-      background: #0c8c72;
-      border-color: #0c8c72;
-      color: #f4fffb;
-    }
-
-    .activity-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: center;
+      padding: 5px 8px;
+      font-weight: 700;
     }
 
     .badge {
@@ -1851,14 +2132,23 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       font-weight: 700;
       text-transform: uppercase;
       border-radius: 999px;
-      padding: 2px 7px;
-      background: var(--chip);
-      color: #2c564d;
-      border: 1px solid #b8d6c7;
+      padding: 2px 8px;
+      background: rgba(63, 136, 118, 0.35);
+      color: #dbfff3;
+      border: 1px solid rgba(109, 184, 162, 0.56);
     }
 
-    .badge.blocked { background: #fff2df; color: #87510f; border-color: #efc891; }
-    .badge.recovery { background: #f3e9ff; color: #5d3f8f; border-color: #d1b8ef; }
+    .badge.blocked {
+      background: rgba(141, 96, 26, 0.4);
+      color: #ffe8b9;
+      border-color: rgba(240, 174, 90, 0.72);
+    }
+
+    .badge.recovery {
+      background: rgba(77, 59, 114, 0.45);
+      color: #e7d7ff;
+      border-color: rgba(169, 134, 231, 0.65);
+    }
 
     .mono {
       font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
@@ -1866,116 +2156,172 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     .logs {
-      max-height: 180px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px;
-      background: #fcfefd;
       white-space: pre-wrap;
       word-break: break-word;
     }
 
-    .error { color: var(--bad); }
-    .done { color: var(--ok); }
+    .error {
+      color: var(--danger);
+    }
 
-    @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
-      .meta-grid { grid-template-columns: 1fr 1fr; }
+    .done {
+      color: var(--ok);
+    }
+
+    body[data-density="compact"] .task-actions {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    body[data-density="compact"] .meta-grid {
+      grid-template-columns: 1fr;
+    }
+
+    @media (max-width: 1200px) {
+      .layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .list,
+      .activity,
+      .logs {
+        max-height: min(34vh, 360px);
+      }
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 8px;
+      }
+
+      .task-actions {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .list,
+      .activity,
+      .logs {
+        max-height: min(30vh, 300px);
+      }
     }
   </style>
 </head>
 <body>
-  <div class="panel">
-    <div class="header">
-      <div class="title">Local Agent</div>
-      <div id="status" class="status-pill">Idle</div>
+  <div class="app">
+    <div class="panel hero">
+      <div class="header">
+        <div class="title">Local Agent Coder</div>
+        <div id="status" class="status-pill">Idle</div>
+      </div>
+      <div class="hint">Plan mode only creates steps. Run Agent will execute tools and file changes.</div>
     </div>
-    <div class="hint">Plan only creates the plan. Run Agent actually executes tools and code changes.</div>
-  </div>
 
-  <div class="layout">
-    <div>
-      <div class="panel">
-        <div class="header">
-          <div class="title">Task</div>
-          <div id="runMeta" class="hint">Mode: - | Model: -</div>
-        </div>
+    <div class="layout">
+      <div class="col col-main">
+        <div class="panel">
+          <div class="header">
+            <div class="title">Task</div>
+            <div id="runMeta" class="hint">Mode: - | Model: - | Thinking: off</div>
+          </div>
 
-        <div class="row">
-          <div class="grow">
-            <input id="baseUrlInput" type="text" placeholder="LM Studio URL (e.g. http://127.0.0.1:1234/v1)" />
+          <div class="fields">
+            <div>
+              <div class="control-label">API Base URL</div>
+              <div class="row">
+                <div class="grow">
+                  <input id="baseUrlInput" type="text" placeholder="LM Studio / OpenRouter URL (e.g. http://127.0.0.1:1234/v1)" />
+                </div>
+                <button id="reloadModels" type="button">Reload Models</button>
+              </div>
+            </div>
+
+            <div>
+              <div class="control-label">Model</div>
+              <select id="modelSelect"></select>
+              <div id="modelInfo" class="hint" style="margin-top:6px;"></div>
+            </div>
+
+            <div>
+              <div class="control-label">Reasoning</div>
+              <div class="row">
+                <label class="toggle-wrap">
+                  <input id="thinkingToggle" type="checkbox" />
+                  Thinking mode
+                </label>
+                <div style="width: 170px; max-width: 100%;">
+                  <select id="thinkingEffort">
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </div>
+              </div>
+              <div class="hint">Enable when task is complex and needs deeper reasoning.</div>
+            </div>
+          </div>
+
+          <div class="control-label" style="margin-top:2px;">Request</div>
+          <textarea id="prompt" placeholder="Describe exactly what to build, fix, or test..."></textarea>
+
+          <div class="task-actions">
+            <button id="planBtn" type="button">Plan Only</button>
+            <button id="runBtn" class="primary" type="button">Run Agent</button>
+            <button id="stopBtn" class="warn" type="button">Stop</button>
+            <button id="clearSessionBtn" type="button">Clear Session</button>
           </div>
         </div>
 
-        <div class="row">
-          <div class="grow">
-            <select id="modelSelect"></select>
+        <div class="panel">
+          <div class="header">
+            <div class="title">Plan Progress</div>
+            <div id="stepStats" class="hint">0/0 done</div>
           </div>
-          <button id="reloadModels">Reload Models</button>
-        </div>
-        <div id="modelTags" class="model-tags"></div>
-        <div id="modelInfo" class="hint"></div>
-
-        <textarea id="prompt" placeholder="Describe what to build or fix..."></textarea>
-
-        <div class="row">
-          <button id="planBtn">Plan Only</button>
-          <button id="runBtn" class="primary">Run Agent</button>
-          <button id="stopBtn" class="warn">Stop</button>
-          <button id="clearSessionBtn">Clear Session</button>
+          <div class="progress"><div id="progressBar"></div></div>
+          <ul id="plan" class="list"></ul>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="header">
-          <div class="title">Plan Progress</div>
-          <div id="stepStats" class="hint">0/0 done</div>
+      <div class="col col-side">
+        <div class="panel">
+          <div class="title">Token Usage</div>
+          <div class="meta-grid">
+            <div class="metric"><div class="k">Prompt</div><div id="tokPrompt" class="v">0</div></div>
+            <div class="metric"><div class="k">Completion</div><div id="tokCompletion" class="v">0</div></div>
+            <div class="metric"><div class="k">Total</div><div id="tokTotal" class="v">0</div></div>
+            <div class="metric"><div class="k">Last Call</div><div id="tokLast" class="v">-</div></div>
+          </div>
         </div>
-        <div class="progress"><div id="progressBar"></div></div>
-        <ul id="plan" class="list" style="margin-top:8px;"></ul>
-      </div>
-    </div>
 
-    <div>
-      <div class="panel">
-        <div class="title" style="margin-bottom:8px;">Token Usage</div>
-        <div class="meta-grid">
-          <div class="metric"><div class="k">Prompt</div><div id="tokPrompt" class="v">0</div></div>
-          <div class="metric"><div class="k">Completion</div><div id="tokCompletion" class="v">0</div></div>
-          <div class="metric"><div class="k">Total</div><div id="tokTotal" class="v">0</div></div>
-          <div class="metric"><div class="k">Last Call</div><div id="tokLast" class="v">-</div></div>
+        <div class="panel">
+          <div class="header">
+            <div class="title">History</div>
+            <div class="hint">Saved per workspace</div>
+          </div>
+          <div id="history" class="activity"></div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="header">
-          <div class="title">History</div>
-          <div class="hint">Saved per workspace</div>
+        <div class="panel">
+          <div class="header">
+            <div class="title">Agent Activity</div>
+            <div class="hint">Realtime action timeline</div>
+          </div>
+          <div id="activity" class="activity"></div>
         </div>
-        <div id="history" class="activity"></div>
-      </div>
 
-      <div class="panel">
-        <div class="header">
-          <div class="title">Agent Activity</div>
-          <div class="hint">Realtime action timeline</div>
+        <div class="panel">
+          <div class="header">
+            <div class="title">Logs</div>
+            <div class="hint">Runtime debug</div>
+          </div>
+          <div id="logs" class="logs mono"></div>
         </div>
-        <div id="activity" class="activity"></div>
-      </div>
-
-      <div class="panel">
-        <div class="header">
-          <div class="title">Logs</div>
-          <div class="hint">Raw debug output</div>
-        </div>
-        <div id="logs" class="logs mono"></div>
       </div>
     </div>
   </div>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const bootThinkingEnabled = ${thinking.enabled ? "true" : "false"};
+    const bootThinkingEffort = ${JSON.stringify(thinking.effort)};
 
     const promptEl = document.getElementById("prompt");
     const statusEl = document.getElementById("status");
@@ -1987,8 +2333,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const reloadModelsBtn = document.getElementById("reloadModels");
     const baseUrlInputEl = document.getElementById("baseUrlInput");
     const modelSelectEl = document.getElementById("modelSelect");
-    const modelTagsEl = document.getElementById("modelTags");
     const modelInfoEl = document.getElementById("modelInfo");
+    const thinkingToggleEl = document.getElementById("thinkingToggle");
+    const thinkingEffortEl = document.getElementById("thinkingEffort");
     const planEl = document.getElementById("plan");
     const progressBarEl = document.getElementById("progressBar");
     const stepStatsEl = document.getElementById("stepStats");
@@ -2003,9 +2350,22 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const state = {
       running: false,
       mode: "-",
-      model: "-"
+      model: "-",
+      thinkingEnabled: Boolean(bootThinkingEnabled),
+      thinkingEffort: String(bootThinkingEffort || "medium")
     };
     const streamNodes = new Map();
+
+    const applyResponsiveDensity = () => {
+      const width = Math.max(window.innerWidth || 0, document.documentElement ? document.documentElement.clientWidth : 0);
+      if (width <= 560) {
+        document.body.dataset.density = "compact";
+      } else if (width <= 960) {
+        document.body.dataset.density = "cozy";
+      } else {
+        document.body.dataset.density = "comfortable";
+      }
+    };
 
     const post = (message) => {
       try {
@@ -2018,6 +2378,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     post({ type: "webview_ready" });
     postTrace("boot");
+    applyResponsiveDensity();
+    window.addEventListener("resize", applyResponsiveDensity);
 
     window.addEventListener("error", (event) => {
       const text = (event && event.message) ? String(event.message) : "Unknown script error.";
@@ -2190,9 +2552,30 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       }
     };
 
+    const normalizeThinkingEffortUi = (value) => {
+      const raw = String(value || "").trim().toLowerCase();
+      if (raw === "low" || raw === "high") {
+        return raw;
+      }
+      return "medium";
+    };
+
+    const syncThinkingControls = () => {
+      state.thinkingEffort = normalizeThinkingEffortUi(state.thinkingEffort);
+      if (thinkingToggleEl) {
+        thinkingToggleEl.checked = Boolean(state.thinkingEnabled);
+        thinkingToggleEl.disabled = Boolean(state.running);
+      }
+      if (thinkingEffortEl) {
+        thinkingEffortEl.value = state.thinkingEffort;
+        thinkingEffortEl.disabled = Boolean(state.running) || !Boolean(state.thinkingEnabled);
+      }
+    };
+
     const refreshRunMeta = () => {
       if (runMetaEl) {
-        runMetaEl.textContent = "Mode: " + state.mode + " | Model: " + state.model;
+        const thinkingLabel = state.thinkingEnabled ? state.thinkingEffort : "off";
+        runMetaEl.textContent = "Mode: " + state.mode + " | Model: " + state.model + " | Thinking: " + thinkingLabel;
       }
     };
 
@@ -2370,9 +2753,6 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       while (modelSelectEl.options.length > 0) {
         modelSelectEl.remove(0);
       }
-      if (modelTagsEl) {
-        modelTagsEl.innerHTML = "";
-      }
 
       const models = normalizeModelItems(payload);
       const modelList = models.length > 0 ? models : [""];
@@ -2395,27 +2775,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         modelSelectEl.selectedIndex = 0;
       }
 
-      const activeModel = modelSelectEl.value;
-      if (modelTagsEl && models.length > 0) {
-        for (const model of models) {
-          const tag = document.createElement("button");
-          tag.type = "button";
-          tag.className = "model-tag" + (model === activeModel ? " active" : "");
-          tag.textContent = model;
-          tag.addEventListener("click", () => {
-            modelSelectEl.value = model;
-            const tags = modelTagsEl.querySelectorAll(".model-tag");
-            tags.forEach((node) => {
-              if (node.textContent === model) {
-                node.classList.add("active");
-              } else {
-                node.classList.remove("active");
-              }
-            });
-          });
-          modelTagsEl.appendChild(tag);
-        }
-      }
+      state.model = modelSelectEl.value || "-";
+      refreshRunMeta();
 
       if (baseUrlInputEl && payload.baseUrl && typeof payload.baseUrl === "string") {
         baseUrlInputEl.value = payload.baseUrl;
@@ -2459,22 +2820,54 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     window.requestModels = requestModels;
 
     if (planBtn) {
-      planBtn.addEventListener("click", () => {
+      planBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
         const prompt = String((promptEl && promptEl.value) || "");
         const model = String((modelSelectEl && modelSelectEl.value) || "");
         const baseUrl = String((baseUrlInputEl && baseUrlInputEl.value) || "");
+        const thinkingEnabled = Boolean(thinkingToggleEl && thinkingToggleEl.checked);
+        const thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl ? thinkingEffortEl.value : state.thinkingEffort);
+        state.thinkingEnabled = thinkingEnabled;
+        state.thinkingEffort = thinkingEffort;
+        syncThinkingControls();
+        refreshRunMeta();
+        postTrace(
+          "run clicked: mode=plan model=" +
+            (model || "(empty)") +
+            " baseUrl=" +
+            (baseUrl || "(empty)") +
+            " thinking=" +
+            (thinkingEnabled ? thinkingEffort : "off")
+        );
         clearForRun();
-        post({ type: "run", mode: "plan", prompt, model, baseUrl });
+        post({ type: "run", mode: "plan", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
       });
     }
 
     if (runBtn) {
-      runBtn.addEventListener("click", () => {
+      runBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
         const prompt = String((promptEl && promptEl.value) || "");
         const model = String((modelSelectEl && modelSelectEl.value) || "");
         const baseUrl = String((baseUrlInputEl && baseUrlInputEl.value) || "");
+        const thinkingEnabled = Boolean(thinkingToggleEl && thinkingToggleEl.checked);
+        const thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl ? thinkingEffortEl.value : state.thinkingEffort);
+        state.thinkingEnabled = thinkingEnabled;
+        state.thinkingEffort = thinkingEffort;
+        syncThinkingControls();
+        refreshRunMeta();
+        postTrace(
+          "run clicked: mode=agent model=" +
+            (model || "(empty)") +
+            " baseUrl=" +
+            (baseUrl || "(empty)") +
+            " thinking=" +
+            (thinkingEnabled ? thinkingEffort : "off")
+        );
         clearForRun();
-        post({ type: "run", mode: "agent", prompt, model, baseUrl });
+        post({ type: "run", mode: "agent", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
       });
     }
 
@@ -2495,24 +2888,28 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (reloadModelsBtn) {
-      reloadModelsBtn.addEventListener("click", () => {
+      reloadModelsBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
         requestModels();
       });
-      reloadModelsBtn.onclick = () => {
-        requestModels();
-      };
     }
 
-    document.addEventListener("click", (event) => {
-      const target = event.target;
-      if (!target || typeof target !== "object") {
-        return;
-      }
-      const node = target;
-      if (node && node.id === "reloadModels") {
-        requestModels();
-      }
-    });
+    if (thinkingToggleEl) {
+      thinkingToggleEl.addEventListener("change", () => {
+        state.thinkingEnabled = Boolean(thinkingToggleEl.checked);
+        syncThinkingControls();
+        refreshRunMeta();
+      });
+    }
+
+    if (thinkingEffortEl) {
+      thinkingEffortEl.addEventListener("change", () => {
+        state.thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl.value);
+        syncThinkingControls();
+        refreshRunMeta();
+      });
+    }
 
     if (baseUrlInputEl) {
       baseUrlInputEl.addEventListener("keydown", (event) => {
@@ -2525,18 +2922,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     if (modelSelectEl) {
       modelSelectEl.addEventListener("change", () => {
-        if (!modelTagsEl) {
-          return;
-        }
-        const current = modelSelectEl.value;
-        const tags = modelTagsEl.querySelectorAll(".model-tag");
-        tags.forEach((node) => {
-          if (node.textContent === current) {
-            node.classList.add("active");
-          } else {
-            node.classList.remove("active");
-          }
-        });
+        state.model = modelSelectEl.value || "-";
+        refreshRunMeta();
       });
     }
 
@@ -2576,6 +2963,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           if (modelSelectEl) {
             modelSelectEl.disabled = disabled;
           }
+          syncThinkingControls();
           break;
         }
 
@@ -2676,6 +3064,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    syncThinkingControls();
     refreshRunMeta();
     postTrace("boot-complete");
     requestModels();

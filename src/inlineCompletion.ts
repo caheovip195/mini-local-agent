@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-import { LmStudioClient, type ChatMessage } from "./lmStudioClient";
+import { LmStudioClient, type ChatMessage, type ThinkingEffort } from "./lmStudioClient";
 import { extractJsonObject } from "./utils";
 
 const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
@@ -49,24 +49,49 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
 
     const providerPresetRaw = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false);
-    const providerPreset = quickOpenRouter ? "openrouter" : providerPresetRaw;
+    const configuredPreset =
+      providerPresetRaw === "openrouter" || providerPresetRaw === "custom" ? providerPresetRaw : "lmstudio";
+    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false) && configuredPreset === "openrouter";
+    const providerPreset = configuredPreset;
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
-    const baseDefault = providerPreset === "openrouter" ? "https://openrouter.ai/api/v1" : legacyBaseUrl;
-    const lmBaseUrl = this.normalizeBaseUrl(quickOpenRouter ? baseDefault : providerBaseUrl || baseDefault, baseDefault);
+    const openRouterDefaultBase = "https://openrouter.ai/api/v1";
+    const baseDefault = providerPreset === "openrouter" ? openRouterDefaultBase : legacyBaseUrl;
+    const baseInput =
+      providerPreset === "openrouter"
+        ? quickOpenRouter
+          ? openRouterDefaultBase
+          : providerBaseUrl || openRouterDefaultBase
+        : providerPreset === "custom"
+          ? providerBaseUrl || legacyBaseUrl
+          : legacyBaseUrl;
+    const lmBaseUrl = this.normalizeBaseUrl(baseInput, baseDefault);
 
     const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
     const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
     const quickOpenRouterApiKey = cfg.get<string>("openRouter.apiKey", "").trim();
-    const apiKey = quickOpenRouter ? quickOpenRouterApiKey || providerApiKey || legacyApiKey : providerApiKey || legacyApiKey;
+    const apiKey =
+      providerPreset === "openrouter"
+        ? quickOpenRouter
+          ? quickOpenRouterApiKey || providerApiKey || legacyApiKey
+          : providerApiKey || quickOpenRouterApiKey || legacyApiKey
+        : providerPreset === "custom"
+          ? providerApiKey || legacyApiKey
+          : legacyApiKey;
 
     const configuredModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
     const providerModel = cfg.get<string>("provider.model", "").trim();
     const quickOpenRouterModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim();
     const inlineModel = cfg.get<string>("inline.model", "").trim();
-    const model =
-      inlineModel.length > 0 ? inlineModel : quickOpenRouter ? quickOpenRouterModel || providerModel || configuredModel : providerModel || configuredModel;
+    const defaultModel =
+      providerPreset === "openrouter"
+        ? quickOpenRouter
+          ? quickOpenRouterModel || providerModel || configuredModel
+          : providerModel || quickOpenRouterModel || configuredModel
+        : providerPreset === "custom"
+          ? providerModel || configuredModel
+          : configuredModel;
+    const model = inlineModel.length > 0 ? inlineModel : defaultModel;
     const chatPath = this.normalizeApiPath(cfg.get<string>("provider.chatPath", "/chat/completions"), "/chat/completions");
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
     const headers: Record<string, string> = { ...extraHeaders };
@@ -90,6 +115,13 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     const maxSuggestionChars = Math.min(Math.max(cfg.get<number>("inline.maxSuggestionChars", 420), 80), 4000);
     const maxCandidates = Math.min(Math.max(cfg.get<number>("inline.maxCandidates", 3), 1), MAX_INLINE_CANDIDATES);
     const verboseLog = cfg.get<boolean>("inline.verboseLog", false);
+    const globalThinkingEnabled = cfg.get<boolean>("thinking.enabled", false);
+    const globalThinkingEffort = this.normalizeThinkingEffort(cfg.get<string>("thinking.effort", "medium"));
+    const inlineThinkingEnabled = cfg.get<boolean>("inline.thinking.enabled", globalThinkingEnabled);
+    const inlineThinkingEffort = this.normalizeThinkingEffort(
+      cfg.get<string>("inline.thinking.effort", globalThinkingEffort)
+    );
+    const thinkingEffort: ThinkingEffort | undefined = inlineThinkingEnabled ? inlineThinkingEffort : undefined;
     if (providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(apiKey)) {
       if (verboseLog) {
         this.output.appendLine("inline suggest skipped: missing OpenRouter API key.");
@@ -201,7 +233,8 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
       const response = await client.chat(messages, abortController.signal, {
         model,
         temperature: 0.08,
-        maxTokens
+        maxTokens,
+        thinkingEffort
       });
 
       const suggestions = this.parseModelCandidates(
@@ -593,6 +626,14 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
         resolve();
       });
     });
+  }
+
+  private normalizeThinkingEffort(value: unknown): ThinkingEffort {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (raw === "low" || raw === "high") {
+      return raw;
+    }
+    return "medium";
   }
 
   private normalizeBaseUrl(input: string, fallback: string): string {

@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.22",
+  "version": "0.0.33",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -201,12 +201,47 @@
           "default": false,
           "description": "Write inline completion debug logs to Local Agent Coder output."
         },
+        "localAgent.inline.thinking.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable thinking mode for inline completion requests."
+        },
+        "localAgent.inline.thinking.effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium",
+          "description": "Reasoning effort for inline completion when inline thinking mode is enabled."
+        },
+        "localAgent.thinking.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable thinking mode for planning/execution requests."
+        },
+        "localAgent.thinking.effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium",
+          "description": "Reasoning effort for planning/execution when thinking mode is enabled."
+        },
         "localAgent.maxTurnsPerStep": {
           "type": "number",
           "default": 10,
           "minimum": 3,
           "maximum": 30,
           "description": "Maximum agent turns per plan step."
+        },
+        "localAgent.strictResponsibilityMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run an internal responsibility review before execute actions (write/run/complete/final) to block off-scope behavior."
         },
         "localAgent.executorMaxTokens": {
           "type": "number",
