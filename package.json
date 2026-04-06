@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.34",
+  "version": "0.0.35",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"

@@ -527,10 +527,19 @@ export class LmStudioClient {
       return undefined;
     }
 
+    const reasoningFallback = (): string | undefined => {
+      const reasoningContent = this.partToText((message as Record<string, unknown>).reasoning_content);
+      const trimmed = reasoningContent.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    };
+
     const content = message.content;
     if (typeof content === "string") {
       const trimmed = content.trim();
-      return trimmed.length > 0 ? trimmed : undefined;
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+      return reasoningFallback();
     }
 
     if (content && typeof content === "object" && !Array.isArray(content)) {
@@ -540,11 +549,7 @@ export class LmStudioClient {
     }
 
     if (!Array.isArray(content)) {
-      const reasoningContent = this.partToText((message as Record<string, unknown>).reasoning_content);
-      if (reasoningContent.trim().length > 0) {
-        return reasoningContent.trim();
-      }
-      return undefined;
+      return reasoningFallback();
     }
 
     const parts = content
@@ -553,7 +558,7 @@ export class LmStudioClient {
       .filter((part) => part.length > 0);
 
     if (parts.length === 0) {
-      return undefined;
+      return reasoningFallback();
     }
 
     return parts.join("\n");

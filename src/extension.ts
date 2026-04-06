@@ -150,7 +150,7 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.34 activated");
+  output.appendLine("Local Agent Coder v0.0.35 activated");
   const provider = new LocalAgentViewProvider(context, output);
   const inlineProvider = new LocalInlineCompletionProvider(output);
 
