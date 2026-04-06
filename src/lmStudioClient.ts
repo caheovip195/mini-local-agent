@@ -40,19 +40,23 @@ export interface ChatResult {
 }
 
 interface ChatCompletionMessage {
-  content?: string | Array<Record<string, unknown>> | null;
+  content?: string | Record<string, unknown> | Array<unknown> | null;
   tool_calls?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
 }
 
 interface ChatCompletionChoice {
   message?: ChatCompletionMessage;
   text?: string | null;
+  [key: string]: unknown;
 }
 
 interface ChatCompletionResponse {
   choices?: ChatCompletionChoice[];
   output_text?: string;
   model?: string;
+  output?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -246,7 +250,7 @@ export class LmStudioClient {
     const data = (await response.json()) as ChatCompletionResponse;
     const content = this.extractCompletionContent(data);
     if (!content) {
-      throw new Error("LM Studio returned empty completion payload.");
+      throw new Error(`${this.providerName} returned empty completion payload. ${this.previewPayloadForError(data)}`);
     }
 
     const responseModel = typeof data.model === "string" && data.model.trim().length > 0 ? data.model : requestedModel;
@@ -296,7 +300,7 @@ export class LmStudioClient {
         const data = (await response.json()) as ChatCompletionResponse;
         const content = this.extractCompletionContent(data);
         if (!content) {
-          throw new Error(`${this.providerName} stream response was empty.`);
+          throw new Error(`${this.providerName} stream response was empty. ${this.previewPayloadForError(data)}`);
         }
         return {
           content,
@@ -424,14 +428,22 @@ export class LmStudioClient {
           if (typeof delta.content === "string") {
             return delta.content;
           }
+          if (delta.content && typeof delta.content === "object" && !Array.isArray(delta.content)) {
+            const text = this.partToText(delta.content);
+            if (text.trim().length > 0) {
+              return text;
+            }
+          }
           if (Array.isArray(delta.content)) {
             const joined = delta.content
-              .filter((part): part is Record<string, unknown> => Boolean(part) && typeof part === "object")
               .map((part) => this.partToText(part))
               .join("");
             if (joined.trim().length > 0) {
               return joined;
             }
+          }
+          if (typeof delta.reasoning_content === "string" && delta.reasoning_content.trim().length > 0) {
+            return delta.reasoning_content;
           }
           if (typeof delta.text === "string") {
             return delta.text;
@@ -449,6 +461,9 @@ export class LmStudioClient {
         if (typeof choice.text === "string") {
           return choice.text;
         }
+        if (typeof choice.content === "string") {
+          return choice.content;
+        }
       }
     }
 
@@ -460,27 +475,48 @@ export class LmStudioClient {
   }
 
   private extractCompletionContent(data: ChatCompletionResponse): string | undefined {
-    const choice = Array.isArray(data.choices) ? data.choices[0] : undefined;
-    const message = choice?.message;
+    const choices = Array.isArray(data.choices) ? data.choices : [];
+    for (const row of choices) {
+      if (!row || typeof row !== "object") {
+        continue;
+      }
+      const choice = row as ChatCompletionChoice;
+      const message = choice.message;
 
-    const messageContent = this.extractMessageContent(message);
-    if (messageContent) {
-      return messageContent;
-    }
+      const messageContent = this.extractMessageContent(message);
+      if (messageContent) {
+        return messageContent;
+      }
 
-    if (message?.tool_calls && message.tool_calls.length > 0) {
-      return JSON.stringify({
-        reasoning: "Converted from LM Studio tool_calls response.",
-        tool_calls: message.tool_calls
-      });
-    }
+      if (message?.tool_calls && message.tool_calls.length > 0) {
+        return JSON.stringify({
+          reasoning: "Converted from tool_calls response.",
+          tool_calls: message.tool_calls
+        });
+      }
 
-    if (typeof choice?.text === "string" && choice.text.trim().length > 0) {
-      return choice.text.trim();
+      if (typeof choice.text === "string" && choice.text.trim().length > 0) {
+        return choice.text.trim();
+      }
+
+      const choiceContent = this.partToText((choice as Record<string, unknown>).content);
+      if (choiceContent.trim().length > 0) {
+        return choiceContent.trim();
+      }
     }
 
     if (typeof data.output_text === "string" && data.output_text.trim().length > 0) {
       return data.output_text.trim();
+    }
+
+    const outputArrayText = this.extractOutputArrayText(data.output);
+    if (outputArrayText) {
+      return outputArrayText;
+    }
+
+    const topText = this.partToText((data as Record<string, unknown>).text);
+    if (topText.trim().length > 0) {
+      return topText.trim();
     }
 
     return undefined;
@@ -497,7 +533,17 @@ export class LmStudioClient {
       return trimmed.length > 0 ? trimmed : undefined;
     }
 
+    if (content && typeof content === "object" && !Array.isArray(content)) {
+      const single = this.partToText(content);
+      const trimmed = single.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    }
+
     if (!Array.isArray(content)) {
+      const reasoningContent = this.partToText((message as Record<string, unknown>).reasoning_content);
+      if (reasoningContent.trim().length > 0) {
+        return reasoningContent.trim();
+      }
       return undefined;
     }
 
@@ -513,15 +559,46 @@ export class LmStudioClient {
     return parts.join("\n");
   }
 
-  private partToText(part: Record<string, unknown>): string {
-    const directText = part.text;
+  private partToText(part: unknown): string {
+    if (typeof part === "string") {
+      return part;
+    }
+    if (!part || typeof part !== "object") {
+      return "";
+    }
+    const row = part as Record<string, unknown>;
+
+    const directText = row.text;
     if (typeof directText === "string") {
       return directText;
     }
 
-    const content = part.content;
+    const value = row.value;
+    if (typeof value === "string") {
+      return value;
+    }
+
+    const outputText = row.output_text;
+    if (typeof outputText === "string") {
+      return outputText;
+    }
+
+    const reasoningContent = row.reasoning_content;
+    if (typeof reasoningContent === "string") {
+      return reasoningContent;
+    }
+
+    const content = row.content;
     if (typeof content === "string") {
       return content;
+    }
+
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => this.partToText(item))
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+        .join("\n");
     }
 
     if (content && typeof content === "object") {
@@ -534,7 +611,43 @@ export class LmStudioClient {
       }
     }
 
+    const delta = row.delta;
+    if (delta && typeof delta === "object") {
+      const deltaText = this.partToText(delta);
+      if (deltaText.trim().length > 0) {
+        return deltaText;
+      }
+    }
+
     return "";
+  }
+
+  private extractOutputArrayText(output: unknown): string | undefined {
+    if (!Array.isArray(output)) {
+      return undefined;
+    }
+    const parts = output
+      .map((item) => this.partToText(item))
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+    if (parts.length === 0) {
+      return undefined;
+    }
+    return parts.join("\n");
+  }
+
+  private previewPayloadForError(payload: unknown): string {
+    try {
+      const text = JSON.stringify(payload);
+      if (!text) {
+        return "Raw payload: (empty)";
+      }
+      const compact = text.replace(/\s+/g, " ").trim();
+      const preview = compact.length > 900 ? `${compact.slice(0, 900)}...` : compact;
+      return `Raw payload preview: ${preview}`;
+    } catch {
+      return "Raw payload preview unavailable.";
+    }
   }
 
   private extractUsage(data: ChatCompletionResponse): TokenUsage | undefined {
