@@ -150,7 +150,7 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.35 activated");
+  output.appendLine("Local Agent Coder v0.0.36 activated");
   const provider = new LocalAgentViewProvider(context, output);
   const inlineProvider = new LocalInlineCompletionProvider(output);
 
@@ -1695,8 +1695,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         thinkingEnabled: thinkingSettings.enabled,
         thinkingEffort: thinkingSettings.effort,
         strictResponsibilityMode: cfg.get<boolean>("strictResponsibilityMode", true),
-        maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 10),
-        executorMaxTokens: cfg.get<number>("executorMaxTokens", 3200),
+        maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 14),
+        executorMaxTokens: cfg.get<number>("executorMaxTokens", 7000),
         maxAskUser: cfg.get<number>("maxAskUser", 0),
         minInvestigationsBeforeExecute: cfg.get<number>("minInvestigationsBeforeExecute", 3),
         strategyCandidates: cfg.get<number>("strategyCandidates", 3),

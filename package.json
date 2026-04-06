@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.35",
+  "version": "0.0.51",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -233,7 +233,7 @@
         },
         "localAgent.maxTurnsPerStep": {
           "type": "number",
-          "default": 10,
+          "default": 14,
           "minimum": 3,
           "maximum": 30,
           "description": "Maximum agent turns per plan step."
@@ -245,7 +245,7 @@
         },
         "localAgent.executorMaxTokens": {
           "type": "number",
-          "default": 3200,
+          "default": 7000,
           "minimum": 600,
           "maximum": 8000,
           "description": "Max completion tokens for each executor turn. Increase if write_file JSON gets truncated."

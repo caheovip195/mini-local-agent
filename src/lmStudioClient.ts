@@ -166,6 +166,12 @@ export class LmStudioClient {
             continue;
           }
         }
+        if (effectiveOptions.responseFormat && this.isJsonModeEmptyPayloadError(lastError.message)) {
+          effectiveOptions = { ...effectiveOptions, responseFormat: undefined };
+          if (attempt < 2) {
+            continue;
+          }
+        }
         if (effectiveOptions.thinkingEffort && this.isThinkingUnsupportedError(lastError.message)) {
           effectiveOptions = { ...effectiveOptions, thinkingEffort: undefined };
           if (attempt < 2) {
@@ -216,6 +222,15 @@ export class LmStudioClient {
     return mentionsThinking && unsupportedSignal;
   }
 
+  private isJsonModeEmptyPayloadError(message: string): boolean {
+    const text = message.toLowerCase();
+    return (
+      text.includes("empty completion payload") ||
+      text.includes("stream response was empty") ||
+      text.includes("stream returned no content")
+    );
+  }
+
   private async chatJson(
     messages: ChatMessage[],
     requestedModel: string,
@@ -248,7 +263,7 @@ export class LmStudioClient {
     }
 
     const data = (await response.json()) as ChatCompletionResponse;
-    const content = this.extractCompletionContent(data);
+    const content = this.extractCompletionContent(data, options?.responseFormat === "json_object");
     if (!content) {
       throw new Error(`${this.providerName} returned empty completion payload. ${this.previewPayloadForError(data)}`);
     }
@@ -298,7 +313,7 @@ export class LmStudioClient {
       const contentType = (response.headers.get("content-type") || "").toLowerCase();
       if (contentType.includes("application/json")) {
         const data = (await response.json()) as ChatCompletionResponse;
-        const content = this.extractCompletionContent(data);
+        const content = this.extractCompletionContent(data, options?.responseFormat === "json_object");
         if (!content) {
           throw new Error(`${this.providerName} stream response was empty. ${this.previewPayloadForError(data)}`);
         }
@@ -359,7 +374,7 @@ export class LmStudioClient {
           usage = parsedUsage;
         }
 
-        const delta = this.extractStreamDeltaContent(payload);
+        const delta = this.extractStreamDeltaContent(payload, options?.responseFormat === "json_object");
         if (!delta) {
           return;
         }
@@ -416,7 +431,7 @@ export class LmStudioClient {
     }
   }
 
-  private extractStreamDeltaContent(payload: Record<string, unknown>): string {
+  private extractStreamDeltaContent(payload: Record<string, unknown>, jsonMode = false): string {
     const choicesRaw = payload.choices;
     if (Array.isArray(choicesRaw) && choicesRaw.length > 0) {
       const firstChoice = choicesRaw[0];
@@ -442,39 +457,39 @@ export class LmStudioClient {
               return joined;
             }
           }
-          if (typeof delta.reasoning_content === "string" && delta.reasoning_content.trim().length > 0) {
+          if (!jsonMode && typeof delta.reasoning_content === "string" && delta.reasoning_content.trim().length > 0) {
             return delta.reasoning_content;
           }
-          if (typeof delta.text === "string") {
+          if (!jsonMode && typeof delta.text === "string") {
             return delta.text;
           }
         }
 
         const messageRaw = choice.message;
         if (messageRaw && typeof messageRaw === "object") {
-          const messageText = this.extractMessageContent(messageRaw as ChatCompletionMessage);
+          const messageText = this.extractMessageContent(messageRaw as ChatCompletionMessage, !jsonMode);
           if (messageText) {
             return messageText;
           }
         }
 
-        if (typeof choice.text === "string") {
+        if (!jsonMode && typeof choice.text === "string") {
           return choice.text;
         }
-        if (typeof choice.content === "string") {
+        if (!jsonMode && typeof choice.content === "string") {
           return choice.content;
         }
       }
     }
 
-    if (typeof payload.output_text === "string") {
+    if (!jsonMode && typeof payload.output_text === "string") {
       return payload.output_text;
     }
 
     return "";
   }
 
-  private extractCompletionContent(data: ChatCompletionResponse): string | undefined {
+  private extractCompletionContent(data: ChatCompletionResponse, jsonMode = false): string | undefined {
     const choices = Array.isArray(data.choices) ? data.choices : [];
     for (const row of choices) {
       if (!row || typeof row !== "object") {
@@ -483,7 +498,7 @@ export class LmStudioClient {
       const choice = row as ChatCompletionChoice;
       const message = choice.message;
 
-      const messageContent = this.extractMessageContent(message);
+      const messageContent = this.extractMessageContent(message, !jsonMode);
       if (messageContent) {
         return messageContent;
       }
@@ -495,39 +510,51 @@ export class LmStudioClient {
         });
       }
 
-      if (typeof choice.text === "string" && choice.text.trim().length > 0) {
+      if (!jsonMode && typeof choice.text === "string" && choice.text.trim().length > 0) {
         return choice.text.trim();
       }
 
-      const choiceContent = this.partToText((choice as Record<string, unknown>).content);
-      if (choiceContent.trim().length > 0) {
-        return choiceContent.trim();
+      if (!jsonMode) {
+        const choiceContent = this.partToText((choice as Record<string, unknown>).content);
+        if (choiceContent.trim().length > 0) {
+          return choiceContent.trim();
+        }
       }
     }
 
-    if (typeof data.output_text === "string" && data.output_text.trim().length > 0) {
+    if (!jsonMode && typeof data.output_text === "string" && data.output_text.trim().length > 0) {
       return data.output_text.trim();
     }
 
-    const outputArrayText = this.extractOutputArrayText(data.output);
-    if (outputArrayText) {
-      return outputArrayText;
+    if (!jsonMode) {
+      const outputArrayText = this.extractOutputArrayText(data.output);
+      if (outputArrayText) {
+        return outputArrayText;
+      }
     }
 
-    const topText = this.partToText((data as Record<string, unknown>).text);
-    if (topText.trim().length > 0) {
-      return topText.trim();
+    if (!jsonMode) {
+      const topText = this.partToText((data as Record<string, unknown>).text);
+      if (topText.trim().length > 0) {
+        return topText.trim();
+      }
     }
 
     return undefined;
   }
 
-  private extractMessageContent(message: ChatCompletionMessage | undefined): string | undefined {
+  private extractMessageContent(
+    message: ChatCompletionMessage | undefined,
+    allowReasoningFallback = true
+  ): string | undefined {
     if (!message) {
       return undefined;
     }
 
     const reasoningFallback = (): string | undefined => {
+      if (!allowReasoningFallback) {
+        return undefined;
+      }
       const reasoningContent = this.partToText((message as Record<string, unknown>).reasoning_content);
       const trimmed = reasoningContent.trim();
       return trimmed.length > 0 ? trimmed : undefined;

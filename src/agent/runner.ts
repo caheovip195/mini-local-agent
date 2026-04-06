@@ -53,13 +53,24 @@ const STEP_HISTORY_TAIL_MESSAGES = 10;
 const MAX_PARSE_ERROR_STREAK_BEFORE_RECOVERY = 2;
 const MAX_REPEATED_ACTION_BLOCKS_BEFORE_RECOVERY = 2;
 const NO_PROGRESS_WARNING_THRESHOLD = 3;
-const MAX_EXTRA_INVESTIGATION_ACTIONS = 3;
+const MAX_EXTRA_INVESTIGATION_ACTIONS = 8;
+const MAX_EXPLORATION_GUARD_BLOCKS_PER_STEP = 3;
+const MAX_EXPLORATION_HARD_CAP_BUFFER = 4;
+const TEST_TASK_INVESTIGATION_HARD_CAP_BONUS = 4;
 const TURN_EXTENSION_CHUNK = 4;
 const MAX_TURN_EXTENSION_TOTAL = 18;
 const MAX_RESPONSIBILITY_BLOCKS_PER_STEP = 4;
-const MAX_WRITE_FILE_CONTENT_CHARS = 4200;
+const MAX_BLOCKED_STREAK_BEFORE_RECOVERY = 5;
+const MAX_SAME_FAILURE_BEFORE_RECOVERY = 2;
+const MAX_WRITE_FILE_CONTENT_CHARS = 90000;
+const MAX_WRITE_FILE_HARD_CAP_CHARS = 220000;
+const FORCE_FULL_FILE_READ = true;
+const READ_FILE_RETURN_CHAR_LIMIT = 28000;
 const MAX_APPEND_FILE_CHUNK_CHARS = 2200;
 const MAX_PATCH_REPLACE_CHARS = 3200;
+const MAX_TRACKED_DIAGNOSTIC_ISSUES = 400;
+const MAX_TRACKED_DIAGNOSTIC_FILES = 12;
+const BATCH_DIAGNOSTIC_TRIGGER_COUNT = 6;
 const ASK_USER_MIN_INVESTIGATIONS = 4;
 const WORKSPACE_INDEX_LIMIT = 4000;
 const SNAPSHOT_HEAD_PREVIEW = 220;
@@ -85,16 +96,58 @@ interface TaskScopeProfile {
   scopeClass: ScopeClass;
   isTestTask: boolean;
   allowRewrite: boolean;
+  requirementComplexity: number;
   maxChangedFiles: number;
   focusTerms: string[];
+  intentLabels: string[];
+  requestedTestTypes: string[];
+  expectedDeliverables: string[];
+  commandHints: string[];
+  requirementChecklist: string[];
   primaryObjective: string;
   contract: string[];
+}
+
+interface ProjectTechProfile {
+  languages: string[];
+  frameworks: string[];
+  versions: string[];
+  evidence: string[];
+  summary: string;
 }
 
 interface WorkspaceSnapshotOptions {
   fileLimit: number;
   keyFiles: string[];
   keyFileCharLimit: number;
+}
+
+interface FailureRecord {
+  stepId: string;
+  actionType: string;
+  target: string;
+  message: string;
+  timestamp: number;
+}
+
+type DiagnosticSeverity = "error" | "warning" | "info";
+
+interface DiagnosticIssue {
+  path: string;
+  line: number;
+  column: number;
+  severity: DiagnosticSeverity;
+  message: string;
+  code?: string;
+}
+
+interface DiagnosticFileSummary {
+  path: string;
+  total: number;
+  errors: number;
+  warnings: number;
+  infos: number;
+  samples: string[];
 }
 
 const PLANNER_SNAPSHOT_OPTIONS: WorkspaceSnapshotOptions = {
@@ -130,12 +183,35 @@ const EXECUTOR_SNAPSHOT_OPTIONS: WorkspaceSnapshotOptions = {
 
 export class LocalAgentRunner {
   private readonly changedFiles = new Set<string>();
+  private readonly knownPaths = new Set<string>();
+  private readonly readSummaryByPath = new Map<string, string>();
+  private readonly stepOutcomeMemory: string[] = [];
+  private readonly recentFailures: FailureRecord[] = [];
+  private projectTechProfile: ProjectTechProfile = {
+    languages: ["unknown"],
+    frameworks: ["unknown"],
+    versions: [],
+    evidence: [],
+    summary: "Language/framework/version not analyzed yet."
+  };
   private askCount = 0;
   private plannerSnapshotCache?: string;
   private executorSnapshotCache?: string;
   private workspaceFileIndexCache?: string[];
   private selectedStrategyBrief = "Use minimal-change implementation aligned with existing project structure.";
   private verificationAttempted = false;
+  private verificationStatus: "not_run" | "failed" | "passed" = "not_run";
+  private pendingValidationAfterWrite = false;
+  private lastVerificationCommand = "";
+  private lastVerificationLog = "";
+  private latestDiagnosticIssues: DiagnosticIssue[] = [];
+  private latestDiagnosticFiles: DiagnosticFileSummary[] = [];
+  private latestDiagnosticSignature = "";
+  private latestDiagnosticCommandKey = "";
+  private writeRevision = 0;
+  private failedVerificationCommandKey = "";
+  private failedVerificationWriteRevision = -1;
+  private failedVerificationDiagnosticSignature = "";
   private currentTaskScope?: TaskScopeProfile;
   private totalInvestigationActions = 0;
 
@@ -148,8 +224,14 @@ export class LocalAgentRunner {
   async createPlan(task: string, signal?: AbortSignal): Promise<ExecutionPlan> {
     const scopeProfile = this.buildTaskScope(task);
     this.currentTaskScope = scopeProfile;
+    await this.refreshProjectTechProfile();
+    await this.enrichTaskScopeWithWorkspace(scopeProfile);
     this.callbacks.onLog(
       `Task scope: class=${scopeProfile.scopeClass}, testTask=${scopeProfile.isTestTask}, allowRewrite=${scopeProfile.allowRewrite}, maxChangedFiles=${scopeProfile.maxChangedFiles}, focus=${scopeProfile.focusTerms.join(", ") || "(none)"}`
+    );
+    this.callbacks.onLog(`Project tech profile: ${this.projectTechProfile.summary}`);
+    this.callbacks.onLog(
+      `Requirement profile: intents=${scopeProfile.intentLabels.join(", ") || "(none)"}; deliverables=${scopeProfile.expectedDeliverables.join(" | ") || "(none)"}; commands=${scopeProfile.commandHints.join(" | ") || "(none)"}`
     );
 
     this.callbacks.onStatus(this.t("Analyzing workspace for planning...", "Đang phân tích workspace để lập kế hoạch..."));
@@ -168,8 +250,22 @@ export class LocalAgentRunner {
         content: [
           `User task:\n${task}`,
           "",
+          "Project technology profile (mandatory preflight):",
+          this.formatProjectTechProfileForPrompt(),
+          "",
           "Task scope contract:",
           ...scopeProfile.contract,
+          "",
+          "Requirement analysis checklist:",
+          ...scopeProfile.requirementChecklist.map((item) => `- ${item}`),
+          "",
+          "Expected deliverables:",
+          ...scopeProfile.expectedDeliverables.map((item) => `- ${item}`),
+          "",
+          "Verification command hints:",
+          ...(scopeProfile.commandHints.length > 0
+            ? scopeProfile.commandHints.map((item) => `- ${item}`)
+            : ["- Use the most relevant local test/lint/typecheck/build command."]),
           "",
           `Primary objective lock: ${scopeProfile.primaryObjective}`,
           `Preferred response language: ${this.getPreferredResponseLanguage()}`,
@@ -210,7 +306,30 @@ export class LocalAgentRunner {
 
   async run(task: string, signal?: AbortSignal): Promise<void> {
     this.verificationAttempted = false;
+    this.verificationStatus = "not_run";
+    this.pendingValidationAfterWrite = false;
+    this.lastVerificationCommand = "";
+    this.lastVerificationLog = "";
+    this.latestDiagnosticIssues = [];
+    this.latestDiagnosticFiles = [];
+    this.latestDiagnosticSignature = "";
+    this.latestDiagnosticCommandKey = "";
+    this.writeRevision = 0;
+    this.failedVerificationCommandKey = "";
+    this.failedVerificationWriteRevision = -1;
+    this.failedVerificationDiagnosticSignature = "";
     this.totalInvestigationActions = 0;
+    this.knownPaths.clear();
+    this.readSummaryByPath.clear();
+    this.stepOutcomeMemory.length = 0;
+    this.recentFailures.length = 0;
+    this.projectTechProfile = {
+      languages: ["unknown"],
+      frameworks: ["unknown"],
+      versions: [],
+      evidence: [],
+      summary: "Language/framework/version not analyzed yet."
+    };
     const plan = await this.createPlan(task, signal);
 
     this.callbacks.onStatus(this.t("Preparing execution context...", "Đang chuẩn bị ngữ cảnh thực thi..."));
@@ -233,6 +352,7 @@ export class LocalAgentRunner {
         if (!result.done) {
           throw new Error(`Step ${step.id} did not complete.`);
         }
+        this.pushStepMemory(`${step.id}: ${truncate(result.summary.replace(/\s+/g, " ").trim(), 220)}`);
         this.callbacks.onLog(`Step ${step.id} completed: ${result.summary}`);
         this.callbacks.onStepStatus(step.id, "done");
         completedSteps += 1;
@@ -289,8 +409,13 @@ export class LocalAgentRunner {
     signal?: AbortSignal
   ): Promise<StepResult> {
     const workspaceContext = await this.getExecutorWorkspaceSnapshot();
+    const persistentMemory = this.buildPersistentMemoryForStep(step);
     const minInvestigations = this.computeRequiredInvestigationsForStep();
     const maxInvestigations = Math.max(minInvestigations + MAX_EXTRA_INVESTIGATION_ACTIONS, minInvestigations * 2);
+    const hardInvestigationCap =
+      maxInvestigations +
+      MAX_EXPLORATION_HARD_CAP_BUFFER +
+      (this.currentTaskScope?.isTestTask ? TEST_TASK_INVESTIGATION_HARD_CAP_BONUS : 0);
 
     const stepMessages: ChatMessage[] = [
       {
@@ -307,14 +432,29 @@ export class LocalAgentRunner {
           `Step details: ${step.details}`,
           `Workspace root: ${this.config.workspaceRoot}`,
           `Selected strategy:\n${this.selectedStrategyBrief}`,
+          "Project technology profile (mandatory preflight):",
+          this.formatProjectTechProfileForPrompt(),
           "Task scope contract:",
           ...(this.currentTaskScope?.contract ?? []),
+          "Requirement analysis checklist:",
+          ...((this.currentTaskScope?.requirementChecklist ?? []).map((item) => `- ${item}`)),
+          "Expected deliverables:",
+          ...((this.currentTaskScope?.expectedDeliverables ?? []).map((item) => `- ${item}`)),
+          "Verification command hints:",
+          ...((this.currentTaskScope?.commandHints?.length ?? 0) > 0
+            ? (this.currentTaskScope?.commandHints ?? []).map((item) => `- ${item}`)
+            : ["- Run the most relevant test/lint/typecheck/build command."]),
           `Primary objective lock: ${this.currentTaskScope?.primaryObjective ?? "Follow user request exactly."}`,
           "You have full read access to all files under workspace root.",
           "Never ask the user where files/screens/components are located; discover by list/search/read actions.",
           `Minimum investigation actions required before write/run/complete: ${minInvestigations}`,
-          "Action payload budget: keep one action JSON compact; if edit is large, split into multiple patch_file/append_file chunks.",
+          `Maximum investigation actions before execution-only mode: ${maxInvestigations}.`,
+          "When investigation budget is exhausted, do NOT use list_files/search_code/read_file again in this step.",
+          "At that point, choose write_file/append_file/patch_file/run_command/complete_step.",
+          "Write policy: prefer one-shot full-file write_file for a target file. Only split when content exceeds hard cap.",
           `Preferred response language: ${this.getPreferredResponseLanguage()}`,
+          "Persistent evidence from previous steps:",
+          persistentMemory,
           "Workspace context:",
           workspaceContext,
           "Return JSON action now."
@@ -327,7 +467,12 @@ export class LocalAgentRunner {
     let lastActionSignature = "";
     let repeatedCount = 0;
     let repeatedActionBlocks = 0;
+    let blockedActionStreak = 0;
+    let repeatedFailureKey = "";
+    let repeatedFailureCount = 0;
     let turnsWithoutProgress = 0;
+    let explorationGuardBlocks = 0;
+    let forceExecutionOnly = false;
     let responsibilityBlocks = 0;
     const seenInvestigationSignatures = new Set<string>();
     let stepTurnLimit = Math.max(3, this.config.maxTurnsPerStep);
@@ -335,6 +480,8 @@ export class LocalAgentRunner {
     const changedFilesAtStepStart = this.changedFiles.size;
     let lastExecutionProgressTurn = 0;
     let executionProgressCount = 0;
+    let lastInvestigationProgressTurn = 0;
+    let investigationProgressCount = 0;
     let extensionCount = 0;
 
     for (let turn = 1; turn <= stepTurnLimit; turn += 1) {
@@ -346,9 +493,17 @@ export class LocalAgentRunner {
         const changedInThisStep = this.changedFiles.size > changedFilesAtStepStart;
         const recentExecutionProgress =
           lastExecutionProgressTurn > 0 && turn - lastExecutionProgressTurn <= 3;
+        const recentInvestigationProgress =
+          lastInvestigationProgressTurn > 0 && turn - lastInvestigationProgressTurn <= 3;
         const shouldExtend =
           turnsWithoutProgress <= 2 &&
-          (recentExecutionProgress || changedInThisStep || executionProgressCount >= 2);
+          (
+            recentExecutionProgress ||
+            recentInvestigationProgress ||
+            changedInThisStep ||
+            executionProgressCount >= 2 ||
+            investigationProgressCount >= minInvestigations + 1
+          );
 
         if (shouldExtend) {
           const extension = Math.min(TURN_EXTENSION_CHUNK, stepTurnHardLimit - stepTurnLimit);
@@ -391,9 +546,10 @@ export class LocalAgentRunner {
 
       let stepResponse;
       try {
+        const maxTokensBoost = parseErrorStreak > 0 ? 800 : 0;
         stepResponse = await this.client.chat(stepMessages, signal, {
           temperature: 0.1,
-          maxTokens: this.getExecutorMaxTokens(),
+          maxTokens: Math.min(8000, this.getExecutorMaxTokens() + maxTokensBoost),
           stream: true,
           thinkingEffort: this.getThinkingEffortOption(),
           responseFormat: "json_object",
@@ -433,8 +589,7 @@ export class LocalAgentRunner {
         });
       }
 
-      this.callbacks.onLog(`Agent ${step.id} turn ${turn}:\n${rawResponse}`);
-      stepMessages.push({ role: "assistant", content: rawResponse });
+      this.callbacks.onLog(`Agent ${step.id} turn ${turn}:\n${truncate(rawResponse, 1800)}`);
 
       let decision: AgentDecision;
       try {
@@ -466,7 +621,7 @@ export class LocalAgentRunner {
           stepMessages.push({
             role: "user",
             content: likelyTruncatedWritePayload
-              ? "Previous output appears to be truncated write_file JSON. Retry STRICT JSON with one action object only. Use patch_file/append_file or content_lines with smaller chunks."
+              ? "Previous output appears to be truncated write_file JSON. Retry STRICT JSON with one action object only. Prefer one-shot write_file full content (or contentBase64)."
               : "Output was not valid JSON for the required schema. Return STRICT JSON only with one action object."
           });
         }
@@ -475,6 +630,17 @@ export class LocalAgentRunner {
       }
 
       parseErrorStreak = 0;
+      stepMessages.push({
+        role: "assistant",
+        content: JSON.stringify(
+          {
+            reasoning: truncate(toStringValue(decision.reasoning, ""), 220),
+            action: decision.action
+          },
+          undefined,
+          0
+        )
+      });
       const actionType = this.normalizeActionType(toStringValue(decision.action.type).trim());
       decision.action.type = actionType;
       this.callbacks.onAction?.({
@@ -484,6 +650,11 @@ export class LocalAgentRunner {
         status: "planned",
         detail: this.safeActionPreview(decision.action)
       });
+
+      if (!this.isInvestigationAction(actionType)) {
+        explorationGuardBlocks = 0;
+        forceExecutionOnly = false;
+      }
 
       const actionSignature = JSON.stringify(decision.action);
       if (actionSignature === lastActionSignature) {
@@ -573,12 +744,22 @@ export class LocalAgentRunner {
         this.isInvestigationAction(actionType) &&
         investigationSignature.length > 0 &&
         seenInvestigationSignatures.has(investigationSignature);
+      const isNewInvestigationAction =
+        this.isInvestigationAction(actionType) &&
+        investigationSignature.length > 0 &&
+        !seenInvestigationSignatures.has(investigationSignature);
 
-      if (this.isInvestigationAction(actionType) && investigationCount >= maxInvestigations && isRepeatedInvestigation) {
+      if (this.isInvestigationAction(actionType) && investigationCount >= hardInvestigationCap) {
+        forceExecutionOnly = true;
+      }
+
+      if (forceExecutionOnly && this.isInvestigationAction(actionType)) {
+        explorationGuardBlocks += 1;
         const guardMessage = [
-          "ExplorationGuard: investigation budget reached and action is repeating existing investigation evidence.",
-          `Investigations done: ${investigationCount}/${maxInvestigations}.`,
-          "Use a different file/query or proceed with write_file, run_command, or complete_step."
+          "ExecutionOnlyGuard: exploration loop detected for this step.",
+          `Investigations done: ${investigationCount}/${maxInvestigations} (hard cap ${hardInvestigationCap}).`,
+          "Do NOT use list_files/search_code/read_file anymore in this step.",
+          "Choose write_file, append_file, patch_file, run_command, or complete_step immediately."
         ].join(" ");
         this.callbacks.onLog(guardMessage);
         this.callbacks.onAction?.({
@@ -590,6 +771,68 @@ export class LocalAgentRunner {
         });
         stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
         turnsWithoutProgress += 1;
+
+        if (explorationGuardBlocks >= MAX_EXPLORATION_GUARD_BLOCKS_PER_STEP) {
+          const recoveryAction = await this.buildRecoveryAction(step, investigationCount);
+          const recovery = await this.executeRecoveryAction(
+            recoveryAction,
+            investigationCount,
+            stepMessages,
+            "ExecutionOnlyRecovery",
+            step.id,
+            turn
+          );
+          investigationCount = recovery.investigationCount;
+          turnsWithoutProgress = recovery.progress ? 0 : turnsWithoutProgress + 1;
+          explorationGuardBlocks = 0;
+
+          if (recovery.finalResult) {
+            return recovery.finalResult;
+          }
+        }
+        continue;
+      }
+
+      const budgetReached = investigationCount >= maxInvestigations;
+      const progressStalled =
+        turnsWithoutProgress >= NO_PROGRESS_WARNING_THRESHOLD && !isNewInvestigationAction;
+      if (this.isInvestigationAction(actionType) && budgetReached && (isRepeatedInvestigation || progressStalled)) {
+        forceExecutionOnly = true;
+        explorationGuardBlocks += 1;
+        const guardMessage = [
+          "ExplorationGuard: investigation budget reached and action is repeating/stalling evidence.",
+          `Investigations done: ${investigationCount}/${maxInvestigations}.`,
+          "Switch to execution now: write_file, append_file, patch_file, run_command, or complete_step."
+        ].join(" ");
+        this.callbacks.onLog(guardMessage);
+        this.callbacks.onAction?.({
+          stepId: step.id,
+          turn,
+          actionType,
+          status: "blocked",
+          detail: guardMessage
+        });
+        stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
+        turnsWithoutProgress += 1;
+
+        if (explorationGuardBlocks >= MAX_EXPLORATION_GUARD_BLOCKS_PER_STEP) {
+          const recoveryAction = await this.buildRecoveryAction(step, investigationCount);
+          const recovery = await this.executeRecoveryAction(
+            recoveryAction,
+            investigationCount,
+            stepMessages,
+            "ExplorationRecovery",
+            step.id,
+            turn
+          );
+          investigationCount = recovery.investigationCount;
+          turnsWithoutProgress = recovery.progress ? 0 : turnsWithoutProgress + 1;
+          explorationGuardBlocks = 0;
+
+          if (recovery.finalResult) {
+            return recovery.finalResult;
+          }
+        }
         continue;
       }
 
@@ -613,16 +856,35 @@ export class LocalAgentRunner {
       }
 
       if (this.shouldRunResponsibilityReview(actionType)) {
-        const review = await this.reviewActionForResponsibility(
-          task,
-          plan,
-          step,
+        const canAutoApproveByEvidence = this.canAutoApproveExecutionByEvidence(
+          actionType,
           decision.action,
-          investigationCount,
-          turn,
-          signal
+          investigationCount
         );
+        const review = canAutoApproveByEvidence
+          ? { approve: true, reason: "Auto-approved by evidence gates." }
+          : await this.reviewActionForResponsibility(
+              task,
+              plan,
+              step,
+              decision.action,
+              investigationCount,
+              turn,
+              signal
+            );
         if (!review.approve && responsibilityBlocks < MAX_RESPONSIBILITY_BLOCKS_PER_STEP) {
+          if (
+            this.shouldBypassResponsibilityRejection(
+              review.reason,
+              actionType,
+              decision.action,
+              investigationCount
+            )
+          ) {
+            this.callbacks.onLog(
+              `ResponsibilityGuard bypassed: rejection looked like invented step-order rule. Reason: ${review.reason}`
+            );
+          } else {
           responsibilityBlocks += 1;
           const guardMessage = [
             `ResponsibilityGuard: ${review.reason}`,
@@ -640,6 +902,7 @@ export class LocalAgentRunner {
           stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
           turnsWithoutProgress += 1;
           continue;
+          }
         }
       }
 
@@ -652,6 +915,70 @@ export class LocalAgentRunner {
       }
 
       const actionResult = await this.executeAction(decision.action, investigationCount);
+      this.recordActionEvidence(step, actionType, decision.action, actionResult);
+      if (actionResult.kind === "tool" && !actionResult.progress) {
+        this.recordFailure(step.id, actionType, decision.action, actionResult.message);
+      }
+      if (actionType === "write_file" && actionResult.kind === "tool" && !actionResult.progress) {
+        const immediateRecoveryAction = await this.buildFailureDrivenRecoveryAction(step, investigationCount);
+        if (immediateRecoveryAction) {
+          const immediateRecovery = await this.executeRecoveryAction(
+            immediateRecoveryAction,
+            investigationCount,
+            stepMessages,
+            "WriteFailureRecovery",
+            step.id,
+            turn
+          );
+          investigationCount = immediateRecovery.investigationCount;
+          turnsWithoutProgress = immediateRecovery.progress ? 0 : turnsWithoutProgress + 1;
+          blockedActionStreak = 0;
+          repeatedFailureKey = "";
+          repeatedFailureCount = 0;
+          if (immediateRecovery.finalResult) {
+            return immediateRecovery.finalResult;
+          }
+          continue;
+        }
+      }
+      const targetPath = toStringValue(decision.action.path).trim();
+      const writeToTestFile =
+        actionType === "write_file" && targetPath.length > 0 && this.isLikelyTestFile(targetPath.toLowerCase());
+      if (
+        !actionResult.progress &&
+        writeToTestFile &&
+        actionResult.message.startsWith("DuplicateGuard:") &&
+        decision.action.allowDuplicate !== true
+      ) {
+        this.callbacks.onLog(
+          `AutoRecovery: DuplicateGuard hit for test file '${targetPath}'. Retrying with allowDuplicate=true.`
+        );
+        const retry = await this.executeRecoveryAction(
+          {
+            ...decision.action,
+            type: "write_file",
+            allowDuplicate: true
+          },
+          investigationCount,
+          stepMessages,
+          "DuplicateAutoBypass",
+          step.id,
+          turn
+        );
+        investigationCount = retry.investigationCount;
+        if (retry.progress) {
+          blockedActionStreak = 0;
+          repeatedFailureKey = "";
+          repeatedFailureCount = 0;
+          turnsWithoutProgress = 0;
+        } else {
+          blockedActionStreak += 1;
+        }
+        if (retry.finalResult) {
+          return retry.finalResult;
+        }
+        continue;
+      }
       this.callbacks.onAction?.({
         stepId: step.id,
         turn,
@@ -667,7 +994,57 @@ export class LocalAgentRunner {
         };
       }
 
-      turnsWithoutProgress = actionResult.progress ? 0 : turnsWithoutProgress + 1;
+      if (!actionResult.progress) {
+        blockedActionStreak += 1;
+        const failurePrefix = actionResult.message.split(":")[0]?.trim() || "unknown";
+        const failureKey = `${actionType}|${failurePrefix}`;
+        if (failureKey === repeatedFailureKey) {
+          repeatedFailureCount += 1;
+        } else {
+          repeatedFailureKey = failureKey;
+          repeatedFailureCount = 1;
+        }
+
+        if (
+          blockedActionStreak >= MAX_BLOCKED_STREAK_BEFORE_RECOVERY ||
+          repeatedFailureCount >= MAX_SAME_FAILURE_BEFORE_RECOVERY
+        ) {
+          this.callbacks.onLog(
+            `BlockedStreakGuard: triggering recovery (blockedStreak=${blockedActionStreak}, sameFailure=${repeatedFailureCount}, key=${failureKey}).`
+          );
+          const recoveryAction = await this.buildRecoveryAction(step, investigationCount);
+          const recovery = await this.executeRecoveryAction(
+            recoveryAction,
+            investigationCount,
+            stepMessages,
+            "BlockedStreakRecovery",
+            step.id,
+            turn
+          );
+          investigationCount = recovery.investigationCount;
+          turnsWithoutProgress = recovery.progress ? 0 : turnsWithoutProgress + 1;
+          blockedActionStreak = 0;
+          repeatedFailureKey = "";
+          repeatedFailureCount = 0;
+
+          if (recovery.finalResult) {
+            return recovery.finalResult;
+          }
+          continue;
+        }
+      } else {
+        blockedActionStreak = 0;
+        repeatedFailureKey = "";
+        repeatedFailureCount = 0;
+      }
+
+      const effectiveProgress =
+        actionResult.progress || (this.isInvestigationAction(actionType) && isNewInvestigationAction);
+      turnsWithoutProgress = effectiveProgress ? 0 : turnsWithoutProgress + 1;
+      if (effectiveProgress && this.isInvestigationAction(actionType) && isNewInvestigationAction) {
+        lastInvestigationProgressTurn = turn;
+        investigationProgressCount += 1;
+      }
       if (actionResult.progress && this.isExecutionAction(actionType)) {
         lastExecutionProgressTurn = turn;
         executionProgressCount += 1;
@@ -812,13 +1189,20 @@ export class LocalAgentRunner {
           }
           const content = await fs.readFile(absPath, "utf8");
           const lines = content.split(/\r?\n/g);
-          const startLine = Math.max(1, Math.floor(startLineRaw));
-          const endLine = Math.max(startLine, Math.floor(endLineRaw));
+          let startLine = Math.max(1, Math.floor(startLineRaw));
+          let endLine = Math.max(startLine, Math.floor(endLineRaw));
+          if (FORCE_FULL_FILE_READ) {
+            startLine = 1;
+            endLine = Math.max(1, lines.length);
+          }
           const chunk = lines.slice(startLine - 1, endLine).join("\n");
 
           return {
             kind: "tool",
-            message: truncate(`FILE ${relPath} [${startLine}-${endLine}]\n${chunk}`),
+            message: truncate(
+              `FILE ${relPath} [${startLine}-${endLine}]\nREAD_MODE: ${FORCE_FULL_FILE_READ ? "full_file" : "range"}\n${chunk}`,
+              READ_FILE_RETURN_CHAR_LIMIT
+            ),
             progress: true
           };
         } catch (error) {
@@ -896,15 +1280,20 @@ export class LocalAgentRunner {
             progress: false
           };
         }
-        if (content.length > MAX_WRITE_FILE_CONTENT_CHARS) {
+        if (content.length > MAX_WRITE_FILE_HARD_CAP_CHARS) {
           return {
             kind: "tool",
             message: [
               `write_file blocked: payload too large (${content.length} chars).`,
-              `Use patch_file/append_file or split content into chunks <= ${MAX_WRITE_FILE_CONTENT_CHARS} chars.`
+              `Hard cap is ${MAX_WRITE_FILE_HARD_CAP_CHARS} chars. Split into patch_file/append_file chunks.`
             ].join(" "),
             progress: false
           };
+        }
+        if (content.length > MAX_WRITE_FILE_CONTENT_CHARS) {
+          this.callbacks.onLog(
+            `WriteGuard: large write_file payload detected (${content.length} chars). Proceeding with direct write.`
+          );
         }
 
         return this.applyWriteFile(filePath, content, {
@@ -1012,6 +1401,11 @@ export class LocalAgentRunner {
         const isVerificationCommand = this.isVerificationCommand(command);
         if (isVerificationCommand) {
           this.verificationAttempted = true;
+          this.lastVerificationCommand = command;
+          const loopGuard = this.evaluateVerificationLoopGuard(command);
+          if (loopGuard) {
+            return { kind: "tool", message: loopGuard, progress: false };
+          }
         }
 
         try {
@@ -1028,10 +1422,43 @@ export class LocalAgentRunner {
           ]
             .filter(Boolean)
             .join("\n");
+          const rendered = output.length > 0 ? output : "Command executed with no output.";
+          const diagnosticNote = this.captureDiagnosticsFromCommandOutput(
+            command,
+            rendered,
+            isVerificationCommand
+          );
+          const renderedWithDiagnostics = diagnosticNote
+            ? `${rendered}\n\n${diagnosticNote}`
+            : rendered;
+          const hasErrorDiagnostics = this.latestDiagnosticFiles.some((item) => item.errors > 0);
+          if (isVerificationCommand) {
+            if (hasErrorDiagnostics) {
+              this.verificationStatus = "failed";
+              this.pendingValidationAfterWrite = true;
+              this.lastVerificationLog = truncate(renderedWithDiagnostics, 2400);
+              this.failedVerificationCommandKey = this.normalizeCommandKey(command);
+              this.failedVerificationWriteRevision = this.writeRevision;
+              this.failedVerificationDiagnosticSignature = this.latestDiagnosticSignature;
+              return {
+                kind: "tool",
+                message: truncate(
+                  `${renderedWithDiagnostics}\n\nVerificationGuard: command exited but still contains syntax/compile errors. Fix diagnostics and rerun.`
+                ),
+                progress: false
+              };
+            }
+            this.verificationStatus = "passed";
+            this.pendingValidationAfterWrite = false;
+            this.lastVerificationLog = truncate(renderedWithDiagnostics, 2400);
+            this.failedVerificationCommandKey = "";
+            this.failedVerificationWriteRevision = -1;
+            this.failedVerificationDiagnosticSignature = "";
+          }
 
           return {
             kind: "tool",
-            message: truncate(output.length > 0 ? output : "Command executed with no output."),
+            message: truncate(renderedWithDiagnostics),
             progress: true
           };
         } catch (error) {
@@ -1043,8 +1470,25 @@ export class LocalAgentRunner {
           ]
             .filter(Boolean)
             .join("\n");
+          const rendered = output || "Command failed.";
+          const diagnosticNote = this.captureDiagnosticsFromCommandOutput(
+            command,
+            rendered,
+            isVerificationCommand
+          );
+          const renderedWithDiagnostics = diagnosticNote
+            ? `${rendered}\n\n${diagnosticNote}`
+            : rendered;
+          if (isVerificationCommand) {
+            this.verificationStatus = "failed";
+            this.pendingValidationAfterWrite = true;
+            this.lastVerificationLog = truncate(renderedWithDiagnostics, 2400);
+            this.failedVerificationCommandKey = this.normalizeCommandKey(command);
+            this.failedVerificationWriteRevision = this.writeRevision;
+            this.failedVerificationDiagnosticSignature = this.latestDiagnosticSignature;
+          }
 
-          return { kind: "tool", message: truncate(output || "Command failed."), progress: false };
+          return { kind: "tool", message: truncate(renderedWithDiagnostics), progress: false };
         }
       }
 
@@ -1089,11 +1533,18 @@ export class LocalAgentRunner {
 
       case "complete_step": {
         const summary = toStringValue(action.summary, "Step completed.");
-        if (this.changedFiles.size > 0 && !this.verificationAttempted) {
+        if (this.changedFiles.size > 0 && (this.pendingValidationAfterWrite || this.verificationStatus !== "passed")) {
+          const suggested = await this.suggestVerificationCommand();
+          const reason =
+            this.verificationStatus === "failed"
+              ? "previous verification failed; fix syntax/runtime errors then rerun."
+              : "verification not passed for latest code changes.";
           return {
-            kind: "complete",
-            message: `${summary} (Verification pending: run a relevant test/lint/typecheck/build command in later step.)`,
-            progress: true
+            kind: "tool",
+            message: suggested
+              ? `QualityGuard: ${reason} Run command: ${suggested}`
+              : `QualityGuard: ${reason} Run a relevant test/lint/typecheck/build command first.`,
+            progress: false
           };
         }
         return { kind: "complete", message: summary, progress: true };
@@ -1106,11 +1557,17 @@ export class LocalAgentRunner {
             return { kind: "tool", message: testQualityIssue, progress: false };
           }
         }
-        if (this.changedFiles.size > 0 && !this.verificationAttempted) {
+        if (this.changedFiles.size > 0 && (this.pendingValidationAfterWrite || this.verificationStatus !== "passed")) {
+          const suggested = await this.suggestVerificationCommand();
+          const reason =
+            this.verificationStatus === "failed"
+              ? "previous verification failed; fix syntax/runtime errors then rerun."
+              : "verification not passed for latest code changes.";
           return {
             kind: "tool",
-            message:
-              "QualityGuard: code changed but no verification command was attempted. Run test/lint/typecheck/build first.",
+            message: suggested
+              ? `QualityGuard: ${reason} Run: ${suggested}`
+              : `QualityGuard: ${reason} Run test/lint/typecheck/build first.`,
             progress: false
           };
         }
@@ -1129,6 +1586,59 @@ export class LocalAgentRunner {
 
   private async buildRecoveryAction(step: PlanStep, investigationCount: number): Promise<AgentAction> {
     const scope = this.currentTaskScope;
+    const minInvestigations = this.computeRequiredInvestigationsForStep();
+    const maxInvestigations = Math.max(minInvestigations + MAX_EXTRA_INVESTIGATION_ACTIONS, minInvestigations * 2);
+    if (this.changedFiles.size > 0 && this.pendingValidationAfterWrite) {
+      if (this.verificationStatus === "failed") {
+        const location = this.extractErrorLocationFromLog(this.lastVerificationLog);
+        if (location) {
+          return {
+            type: "read_file",
+            path: location.path,
+            startLine: location.startLine,
+            endLine: location.endLine
+          };
+        }
+        if (this.lastVerificationCommand.trim().length > 0) {
+          return {
+            type: "run_command",
+            command: this.lastVerificationCommand
+          };
+        }
+      }
+      if (this.verificationStatus === "not_run") {
+        const suggested = await this.suggestVerificationCommand();
+        if (suggested) {
+          return {
+            type: "run_command",
+            command: suggested
+          };
+        }
+      }
+    }
+    const failureDriven = await this.buildFailureDrivenRecoveryAction(step, investigationCount);
+    if (failureDriven) {
+      return failureDriven;
+    }
+    if (this.changedFiles.size > 0 && !this.verificationAttempted && investigationCount >= Math.max(1, minInvestigations - 1)) {
+      const suggested = await this.suggestVerificationCommand();
+      if (suggested) {
+        return {
+          type: "run_command",
+          command: suggested
+        };
+      }
+    }
+
+    if (investigationCount >= maxInvestigations) {
+      return {
+        type: "complete_step",
+        summary: this.t(
+          "Exploration budget exhausted for this step. Proceeding to next step with current evidence.",
+          "Đã hết ngân sách điều tra cho bước này. Chuyển sang bước tiếp theo với bằng chứng hiện có."
+        )
+      };
+    }
 
     if (investigationCount <= 0) {
       if (scope?.isTestTask) {
@@ -1194,20 +1704,346 @@ export class LocalAgentRunner {
     };
   }
 
+  private async buildFailureDrivenRecoveryAction(
+    step: PlanStep,
+    investigationCount: number
+  ): Promise<AgentAction | undefined> {
+    const failures = this.recentFailures.filter((item) => item.stepId === step.id).slice(-6);
+    if (failures.length === 0) {
+      return undefined;
+    }
+
+    const latest = failures[failures.length - 1];
+    const lowerMessage = latest.message.toLowerCase();
+    const triedCommands = new Set(
+      failures
+        .filter((item) => item.actionType === "run_command")
+        .map((item) => item.target.trim())
+        .filter((item) => item.length > 0)
+    );
+    const alternatives: string[] = [];
+
+    const pick = (action: AgentAction, reason: string): AgentAction => {
+      const actionPreview = this.safeActionPreview(action);
+      this.callbacks.onLog(
+        `FailureAnalyzer: step=${step.id}; lastFailure=${latest.actionType} :: ${latest.message}\nAlternatives: ${alternatives.join(" | ") || "(none)"}\nSelected: ${actionPreview}\nReason: ${reason}`
+      );
+      return action;
+    };
+
+    if (lowerMessage.includes("qualityguard")) {
+      alternatives.push("run suggested verification command");
+      const suggested = this.extractSuggestedCommandFromMessage(latest.message) ?? (await this.suggestVerificationCommand());
+      if (suggested) {
+        return pick(
+          {
+            type: "run_command",
+            command: suggested
+          },
+          "QualityGuard failure requires verification command before proceeding."
+        );
+      }
+    }
+
+    if (latest.actionType === "run_command") {
+      if (this.looksLikeSyntaxOrCompileFailure(latest.message)) {
+        const location = this.extractErrorLocationFromLog(latest.message);
+        if (location) {
+          alternatives.push(`read_file ${location.path}:${location.startLine}-${location.endLine}`);
+          return pick(
+            {
+              type: "read_file",
+              path: location.path,
+              startLine: location.startLine,
+              endLine: location.endLine
+            },
+            "Command failed with syntax/compile errors; inspect exact failing file range first."
+          );
+        }
+      }
+      const commandAlternatives = this.buildCommandAlternativesFromFailure(latest.target, latest.message);
+      for (const candidate of commandAlternatives) {
+        alternatives.push(candidate);
+      }
+      const best = commandAlternatives.find((candidate) => candidate.length > 0 && !triedCommands.has(candidate));
+      if (best) {
+        return pick(
+          {
+            type: "run_command",
+            command: best
+          },
+          "Choose an untried command alternative derived from failure log."
+        );
+      }
+
+      const suggested = await this.suggestVerificationCommand();
+      if (suggested && !triedCommands.has(suggested)) {
+        alternatives.push(suggested);
+        return pick(
+          {
+            type: "run_command",
+            command: suggested
+          },
+          "Fallback to stack-aware verification command hint."
+        );
+      }
+
+      if (/not found|enoent|command not found/.test(lowerMessage)) {
+        const diagnostic = "which fvm || true; which flutter || true; flutter --version || true; fvm flutter --version || true";
+        alternatives.push(diagnostic);
+        if (!triedCommands.has(diagnostic)) {
+          return pick(
+            {
+              type: "run_command",
+              command: diagnostic
+            },
+            "Gather toolchain diagnostics to select next executable command."
+          );
+        }
+      }
+    }
+
+    if (/pathguard|framework\/dependency|off-scope/.test(lowerMessage)) {
+      if (this.currentTaskScope?.isTestTask) {
+        const pattern = await this.pickTestListPatternFromScope();
+        alternatives.push(`list_files ${pattern}`);
+        return pick(
+          {
+            type: "list_files",
+            pattern,
+            limit: 500
+          },
+          "Last action touched blocked path; switch back to project test roots."
+        );
+      }
+      alternatives.push("list_files lib/**/*");
+      return pick(
+        {
+          type: "list_files",
+          pattern: "lib/**/*",
+          limit: 500
+        },
+        "Last action drifted into blocked paths; re-anchor to project source roots."
+      );
+    }
+
+    if (latest.actionType === "search_code" && /search results: none/.test(lowerMessage)) {
+      const pattern = this.buildFilePatternFromStep(step);
+      alternatives.push(`list_files ${pattern}`);
+      return pick(
+        {
+          type: "list_files",
+          pattern,
+          limit: 500
+        },
+        "Search returned none; pivot to filename discovery with focus terms."
+      );
+    }
+
+    if (latest.actionType === "write_file" && /scopeguard|reuseguard|duplicateguard/.test(lowerMessage)) {
+      const focusedTest = await this.findFirstTestFileForScope();
+      if (focusedTest) {
+        alternatives.push(`read_file ${focusedTest}`);
+        return pick(
+          {
+            type: "read_file",
+            path: focusedTest
+          },
+          "Write blocked; inspect nearest existing test file and adapt instead of creating new blind file."
+        );
+      }
+    }
+
+    if (investigationCount >= this.computeRequiredInvestigationsForStep()) {
+      alternatives.push("complete_step with evidence summary");
+      return pick(
+        {
+          type: "complete_step",
+          summary: this.t(
+            "Step recovery: no higher-confidence alternative from recent failures. Move to next step with evidence.",
+            "Phục hồi bước: chưa có phương án thay thế tin cậy hơn từ log lỗi gần đây. Chuyển bước tiếp theo với bằng chứng hiện có."
+          )
+        },
+        "Avoid repeating failed actions when no better alternative remains."
+      );
+    }
+
+    return undefined;
+  }
+
+  private extractSuggestedCommandFromMessage(message: string): string | undefined {
+    const match = message.match(/Run(?: command)?:\s*([^\n]+)/i);
+    if (!match?.[1]) {
+      return undefined;
+    }
+    const command = match[1].trim();
+    return command.length > 0 ? command : undefined;
+  }
+
+  private buildCommandAlternativesFromFailure(command: string, failureMessage: string): string[] {
+    const source = command.trim();
+    if (!source) {
+      return [];
+    }
+
+    const out = new Set<string>();
+    const lowerSource = source.toLowerCase();
+    const lowerFailure = failureMessage.toLowerCase();
+
+    const chainedIndex = source.indexOf("&&");
+    if (chainedIndex > 0) {
+      const stripped = source.slice(chainedIndex + 2).trim();
+      if (stripped.length > 0) {
+        out.add(stripped);
+      }
+    }
+
+    if (lowerSource.includes("/.fvm/flutter_sdk/bin/cache/dart-sdk/bin/dart")) {
+      const normalized = source.replace(
+        /.*\/\.fvm\/flutter_sdk\/bin\/cache\/dart-sdk\/bin\/dart\s+/i,
+        "dart "
+      );
+      out.add(normalized);
+      out.add(
+        normalized.replace(/\bdart\s+pub\b/i, "fvm flutter pub").replace(/\bdart\s+test\b/i, "fvm flutter test")
+      );
+      out.add(
+        normalized.replace(/\bdart\s+pub\b/i, "flutter pub").replace(/\bdart\s+test\b/i, "flutter test")
+      );
+    }
+
+    if (lowerSource.includes("fvm flutter ")) {
+      out.add(source.replace(/fvm\s+flutter\s+/i, "flutter "));
+    }
+
+    if (/\bflutter\b/.test(lowerSource) && !/fvm\s+flutter/.test(lowerSource)) {
+      out.add(source.replace(/\bflutter\b/i, "fvm flutter"));
+    }
+
+    if (/^cd\s+[^&]+&&\s*/i.test(source)) {
+      out.add(source.replace(/^cd\s+[^&]+&&\s*/i, ""));
+    }
+
+    if (lowerFailure.includes("command not found") || lowerFailure.includes("enoent")) {
+      if (lowerSource.includes("fvm ")) {
+        out.add(source.replace(/\bfvm\s+/i, ""));
+      }
+      if (/\bflutter\b/.test(lowerSource) && !/fvm\s+flutter/.test(lowerSource)) {
+        out.add(source.replace(/\bflutter\b/i, "fvm flutter"));
+      }
+    }
+
+    return Array.from(out.values()).filter((item) => item.trim().length > 0);
+  }
+
+  private looksLikeSyntaxOrCompileFailure(log: string): boolean {
+    const lower = log.toLowerCase();
+    const signals = [
+      "syntax error",
+      "compilation failed",
+      "failed to compile",
+      "analyzer found",
+      "error:",
+      "undefined name",
+      "expected ';'",
+      "expected ')'",
+      "not assignable",
+      "no such method",
+      "isn't defined",
+      "unable to resolve",
+      "type mismatch"
+    ];
+    return signals.some((signal) => lower.includes(signal));
+  }
+
+  private extractErrorLocationFromLog(
+    log: string
+  ): { path: string; startLine: number; endLine: number } | undefined {
+    if (!log.trim()) {
+      return undefined;
+    }
+
+    const regex = /([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):(\d+)(?::(\d+))?/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(log)) !== null) {
+      const rawPath = (match[1] || "").trim();
+      const rawLine = Number(match[2] || "1");
+      if (!rawPath || Number.isNaN(rawLine)) {
+        continue;
+      }
+      if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
+        continue;
+      }
+
+      let relPath = rawPath;
+      try {
+        const absPath = path.isAbsolute(rawPath)
+          ? path.normalize(rawPath)
+          : path.resolve(this.config.workspaceRoot, rawPath);
+        const relative = path.relative(this.config.workspaceRoot, absPath).split(path.sep).join("/");
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          continue;
+        }
+        relPath = relative;
+      } catch {
+        continue;
+      }
+
+      if (this.isFrameworkOrGeneratedPath(relPath.toLowerCase())) {
+        continue;
+      }
+
+      const center = Math.max(1, Math.floor(rawLine));
+      return {
+        path: relPath,
+        startLine: Math.max(1, center - 60),
+        endLine: center + 120
+      };
+    }
+
+    return undefined;
+  }
+
   private buildSearchPatternFromStep(step: PlanStep): string {
     const keywords = this.extractStepKeywords(step, 4);
-    if (keywords.length === 0) {
+    const focusTerms = (this.currentTaskScope?.focusTerms ?? []).slice(0, 4);
+    const seeds = Array.from(new Set([...keywords, ...focusTerms])).slice(0, 6);
+    if (seeds.length === 0) {
       return "todo|fix|implement";
     }
-    return keywords.join("|");
+    const variants = new Set<string>();
+    for (const seed of seeds) {
+      for (const variant of this.buildSearchTermVariants(seed)) {
+        const escaped = this.escapeRegexTerm(variant);
+        if (escaped.length >= 3) {
+          variants.add(escaped);
+        }
+        if (variants.size >= 12) {
+          break;
+        }
+      }
+      if (variants.size >= 12) {
+        break;
+      }
+    }
+    if (variants.size === 0) {
+      return "todo|fix|implement";
+    }
+    return Array.from(variants.values()).join("|");
   }
 
   private buildFilePatternFromStep(step: PlanStep): string {
-    const keywords = this.extractStepKeywords(step, 3);
+    const keywords = [
+      ...this.extractStepKeywords(step, 3),
+      ...(this.currentTaskScope?.focusTerms ?? []).slice(0, 3)
+    ];
     for (const keyword of keywords) {
-      const safe = keyword.replace(/[^a-z0-9_-]/gi, "");
-      if (safe.length >= 3) {
-        return `**/*${safe}*`;
+      const parts = this.splitComparableTokens(keyword).filter((token) => token.length >= 3);
+      if (parts.length > 0) {
+        const best = [...parts].sort((a, b) => b.length - a.length)[0];
+        if (best.length >= 3) {
+          return `**/*${best}*`;
+        }
       }
     }
     return "**/*";
@@ -1540,16 +2376,22 @@ export class LocalAgentRunner {
   private computeRequiredInvestigationsForStep(): number {
     const base = Math.max(1, this.config.minInvestigationsBeforeExecute);
     const scope = this.currentTaskScope;
+    const complexityBonus = scope ? Math.min(2, Math.max(0, scope.requirementComplexity - 2)) : 0;
+    const minDeepAnalysis = scope?.isTestTask ? 3 : 2;
 
     if (this.totalInvestigationActions === 0) {
-      return base;
+      return Math.min(6, Math.max(base + complexityBonus, minDeepAnalysis));
+    }
+
+    if (!this.hasFocusEvidence()) {
+      return Math.min(6, Math.max(base + complexityBonus, minDeepAnalysis + 1));
     }
 
     if (scope?.isTestTask) {
-      return Math.max(1, Math.min(2, base));
+      return Math.max(2, Math.min(5, base + complexityBonus));
     }
 
-    return Math.max(1, Math.min(2, base));
+    return Math.max(2, Math.min(4, base + complexityBonus));
   }
 
   private isInvestigationAction(type: string): boolean {
@@ -1564,7 +2406,7 @@ export class LocalAgentRunner {
     if (!this.config.strictResponsibilityMode) {
       return false;
     }
-    return ["write_file", "append_file", "patch_file", "run_command", "complete_step", "final_answer"].includes(type);
+    return ["write_file", "append_file", "patch_file", "complete_step", "final_answer"].includes(type);
   }
 
   private async reviewActionForResponsibility(
@@ -1578,6 +2420,13 @@ export class LocalAgentRunner {
   ): Promise<ResponsibilityReviewResult> {
     if (!this.config.strictResponsibilityMode) {
       return { approve: true, reason: "Responsibility mode disabled." };
+    }
+    const actionPayloadChars = this.estimateActionPayloadChars(action);
+    if (actionPayloadChars > 2600) {
+      this.callbacks.onLog(
+        `Responsibility review skipped: action payload too large (${actionPayloadChars} chars). Auto-approve with scope guards.`
+      );
+      return { approve: true, reason: "Skipped for large payload; scope guards still active." };
     }
 
     try {
@@ -1599,6 +2448,8 @@ export class LocalAgentRunner {
               "- Reject actions that drift into unrelated feature work/refactor.",
               "- For test tasks: reject non-test implementation actions unless explicitly requested.",
               "- Reject complete_step/final_answer if request deliverable is likely not fulfilled.",
+              "- Do NOT invent rule numbers or strict step-order preconditions (e.g. 'must finish S1/S2 first').",
+              "- If action is a scoped test-file write/update and investigation evidence exists, approve.",
               "- Keep reason short and concrete.",
               `- Use language: ${this.getPreferredResponseLanguage()}.`
             ].join("\n")
@@ -1613,10 +2464,16 @@ export class LocalAgentRunner {
               `Step details: ${step.details}`,
               "",
               `Primary objective: ${scope?.primaryObjective ?? "Follow user request exactly."}`,
+              `Project tech profile: ${this.projectTechProfile.summary}`,
+              `Intent labels: ${(scope?.intentLabels ?? []).join(", ") || "(none)"}`,
+              `Expected deliverables: ${(scope?.expectedDeliverables ?? []).join(" | ") || "(none)"}`,
+              `Requirement checklist: ${(scope?.requirementChecklist ?? []).join(" | ") || "(none)"}`,
+              `Verification hints: ${(scope?.commandHints ?? []).join(" | ") || "(none)"}`,
               `Focus terms: ${(scope?.focusTerms ?? []).join(", ") || "(none)"}`,
               `Is test task: ${scope?.isTestTask ? "yes" : "no"}`,
               `Investigation count: ${investigationCount}`,
               `Changed files: ${changedPreview || "(none)"}`,
+              `Persistent evidence snapshot:\n${this.buildPersistentMemoryForStep(step)}`,
               "",
               `Proposed action JSON:\n${JSON.stringify(action)}`,
               "",
@@ -1657,10 +2514,105 @@ export class LocalAgentRunner {
         reason
       };
     } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      this.callbacks.onLog(`Responsibility review skipped: ${text}`);
+      this.callbacks.onLog("Responsibility review unavailable. Continue with deterministic scope guards.");
       return { approve: true, reason: "Review unavailable; continue with safeguards." };
     }
+  }
+
+  private canAutoApproveExecutionByEvidence(
+    actionType: string,
+    action: AgentAction,
+    investigationCount: number
+  ): boolean {
+    if (!["write_file", "append_file", "patch_file"].includes(actionType)) {
+      return false;
+    }
+    const minInvestigations = this.computeRequiredInvestigationsForStep();
+    if (investigationCount < minInvestigations) {
+      return false;
+    }
+
+    const scope = this.currentTaskScope;
+    const pathValue = toStringValue(action.path).trim().toLowerCase();
+    if (!scope) {
+      return this.hasFocusEvidence();
+    }
+
+    if (scope.isTestTask) {
+      if (pathValue.length > 0 && !this.isLikelyTestFile(pathValue)) {
+        return false;
+      }
+      if (pathValue.length > 0 && this.pathMatchesFocusTerms(pathValue, scope.focusTerms)) {
+        return true;
+      }
+      return this.hasFocusEvidence();
+    }
+
+    if (pathValue.length > 0 && this.pathMatchesFocusTerms(pathValue, scope.focusTerms)) {
+      return true;
+    }
+    return this.hasFocusEvidence();
+  }
+
+  private shouldBypassResponsibilityRejection(
+    reason: string,
+    actionType: string,
+    action: AgentAction,
+    investigationCount: number
+  ): boolean {
+    const lowerReason = reason.toLowerCase();
+    const looksLikeStepOrderHallucination =
+      /step\s*s?\d|quy tắc|rule\s*\d|must\s+finish|before\s+complet|chưa\s+hoàn\s+thành|vi\s+phạm/.test(lowerReason);
+    if (!looksLikeStepOrderHallucination) {
+      return false;
+    }
+    return this.canAutoApproveExecutionByEvidence(actionType, action, investigationCount);
+  }
+
+  private hasFocusEvidence(): boolean {
+    const scope = this.currentTaskScope;
+    if (!scope) {
+      return this.knownPaths.size > 0 || this.readSummaryByPath.size > 0;
+    }
+
+    if (scope.focusTerms.length === 0) {
+      return this.knownPaths.size > 0 || this.readSummaryByPath.size > 0;
+    }
+
+    for (const known of this.knownPaths) {
+      if (this.pathMatchesFocusTerms(known, scope.focusTerms)) {
+        return true;
+      }
+    }
+    for (const known of this.readSummaryByPath.keys()) {
+      if (this.pathMatchesFocusTerms(known, scope.focusTerms)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private estimateActionPayloadChars(action: AgentAction): number {
+    let total = 0;
+    for (const [key, value] of Object.entries(action)) {
+      if (typeof value === "string") {
+        total += value.length;
+        continue;
+      }
+      if (Array.isArray(value)) {
+        total += value.reduce((sum, item) => sum + (typeof item === "string" ? item.length : 8), 0);
+        continue;
+      }
+      if (value && typeof value === "object") {
+        total += JSON.stringify(value).length;
+        continue;
+      }
+      if (key.length > 0) {
+        total += key.length;
+      }
+    }
+    return total;
   }
 
   private buildInvestigationSignature(type: string, action: AgentAction): string {
@@ -1672,6 +2624,9 @@ export class LocalAgentRunner {
       const path = toStringValue(action.path).trim().toLowerCase();
       if (!path) {
         return "read_file:";
+      }
+      if (FORCE_FULL_FILE_READ) {
+        return `read_file:${path}:full`;
       }
       const startLine = toNumberValue(action.startLine, 1);
       const endLine = toNumberValue(action.endLine, Number.MAX_SAFE_INTEGER);
@@ -1784,11 +2739,239 @@ export class LocalAgentRunner {
   }
 
   private toStreamPreview(value: string, maxChars = 900): string {
-    const text = value || "";
+    const raw = value || "";
+    const jsonStart = raw.indexOf("{");
+    const text = jsonStart >= 0 ? raw.slice(jsonStart) : "";
+    if (!text) {
+      return "";
+    }
     if (text.length <= maxChars) {
       return text;
     }
     return `...${text.slice(text.length - maxChars)}`;
+  }
+
+  private pushStepMemory(note: string): void {
+    const clean = note.trim();
+    if (!clean) {
+      return;
+    }
+    this.stepOutcomeMemory.push(clean);
+    if (this.stepOutcomeMemory.length > 28) {
+      this.stepOutcomeMemory.splice(0, this.stepOutcomeMemory.length - 28);
+    }
+  }
+
+  private rememberPath(pathLike: string): void {
+    const normalized = pathLike.replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+    if (!normalized) {
+      return;
+    }
+    if (this.isFrameworkOrGeneratedPath(normalized)) {
+      return;
+    }
+    this.knownPaths.add(normalized);
+  }
+
+  private buildPersistentMemoryForStep(step: PlanStep): string {
+    const scopeTerms = this.currentTaskScope?.focusTerms ?? [];
+    const stepTerms = this.extractStepKeywords(step, 6);
+    const terms = Array.from(new Set([...scopeTerms, ...stepTerms])).filter((term) => term.length >= 3);
+
+    const ranked = Array.from(this.knownPaths.values())
+      .filter((file) => {
+        if (terms.length === 0) {
+          return true;
+        }
+        const lower = file.toLowerCase();
+        return terms.some((term) => lower.includes(term.toLowerCase()));
+      })
+      .sort((a, b) => this.comparePathPriority(a, b))
+      .slice(0, 18);
+
+    const lines: string[] = [];
+    if (ranked.length > 0) {
+      lines.push("Known relevant files:");
+      for (const file of ranked) {
+        const summary = this.readSummaryByPath.get(file);
+        lines.push(summary ? `- ${file} :: ${summary}` : `- ${file}`);
+      }
+    }
+
+    const recentOutcomes = this.stepOutcomeMemory.slice(-8);
+    if (recentOutcomes.length > 0) {
+      lines.push("Recent executed outcomes:");
+      for (const item of recentOutcomes) {
+        lines.push(`- ${item}`);
+      }
+    }
+
+    if (lines.length === 0) {
+      return "(none yet)";
+    }
+    return truncate(lines.join("\n"), 2400);
+  }
+
+  private recordActionEvidence(
+    step: PlanStep,
+    actionType: string,
+    action: AgentAction,
+    actionResult: ActionExecutionResult
+  ): void {
+    const pathValue = toStringValue(action.path).trim();
+    if (pathValue.length > 0) {
+      this.rememberPath(pathValue);
+    }
+
+    if (actionType === "list_files" && actionResult.progress) {
+      const listed = this.extractPathsFromListFilesResult(actionResult.message);
+      listed.forEach((file) => this.rememberPath(file));
+      if (listed.length > 0) {
+        this.pushStepMemory(`${step.id}: listed ${listed.length} file(s)`);
+      }
+    }
+
+    if (actionType === "search_code" && actionResult.progress) {
+      const hits = this.extractPathsFromSearchResult(actionResult.message);
+      hits.forEach((file) => this.rememberPath(file));
+      if (hits.length > 0) {
+        this.pushStepMemory(`${step.id}: search matched ${hits.length} file(s)`);
+      }
+    }
+
+    if (actionType === "read_file" && actionResult.progress && pathValue.length > 0) {
+      const summary = this.buildReadSummaryFromToolMessage(actionResult.message);
+      if (summary.length > 0) {
+        this.readSummaryByPath.set(pathValue.replace(/\\/g, "/").replace(/^\.\/+/, ""), summary);
+        this.pushStepMemory(`${step.id}: read ${pathValue}`);
+      }
+    }
+
+    if (actionResult.progress && ["write_file", "append_file", "patch_file"].includes(actionType) && pathValue.length > 0) {
+      this.pushStepMemory(`${step.id}: wrote ${pathValue}`);
+      this.pendingValidationAfterWrite = true;
+      this.verificationStatus = "not_run";
+    }
+
+    if (actionType === "run_command") {
+      const command = toStringValue(action.command).trim();
+      const summary = this.summarizeCommandResult(actionResult.message);
+      const commandLabel = command || "(unknown command)";
+      this.pushStepMemory(
+        `${step.id}: command ${actionResult.progress ? "ok" : "failed"} :: ${commandLabel} :: ${summary}`
+      );
+    }
+  }
+
+  private summarizeCommandResult(message: string): string {
+    const compact = message.replace(/\s+/g, " ").trim();
+    if (!compact) {
+      return "no output";
+    }
+    if (/ERROR:/i.test(compact)) {
+      return truncate(compact, 220);
+    }
+    const passLike = /(no issues found|analyze|passed|success|0 failed|all tests passed)/i.test(compact);
+    if (passLike) {
+      return truncate(compact, 220);
+    }
+    return truncate(compact, 220);
+  }
+
+  private recordFailure(stepId: string, actionType: string, action: AgentAction, message: string): void {
+    const target = this.extractActionTarget(actionType, action);
+    this.recentFailures.push({
+      stepId,
+      actionType,
+      target,
+      message: truncate(message.replace(/\s+/g, " ").trim(), 900),
+      timestamp: Date.now()
+    });
+    if (this.recentFailures.length > 80) {
+      this.recentFailures.splice(0, this.recentFailures.length - 80);
+    }
+  }
+
+  private extractActionTarget(actionType: string, action: AgentAction): string {
+    if (actionType === "run_command") {
+      return toStringValue(action.command).trim();
+    }
+    if (actionType === "write_file" || actionType === "append_file" || actionType === "patch_file" || actionType === "read_file") {
+      return toStringValue(action.path).trim();
+    }
+    if (actionType === "search_code") {
+      return toStringValue(action.pattern).trim();
+    }
+    if (actionType === "list_files") {
+      return toStringValue(action.pattern, "**/*").trim();
+    }
+    return "";
+  }
+
+  private extractPathsFromListFilesResult(message: string): string[] {
+    const lines = message.split(/\r?\n/g);
+    const paths: string[] = [];
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line.startsWith("Found ") || line.startsWith("...<truncated>")) {
+        continue;
+      }
+      if (!line.includes("/") && !line.includes(".")) {
+        continue;
+      }
+      if (line.includes(": ") && !line.includes("/")) {
+        continue;
+      }
+      const candidate = line.replace(/^-\s+/, "").trim();
+      if (candidate) {
+        paths.push(candidate);
+      }
+    }
+    return Array.from(new Set(paths)).slice(0, 120);
+  }
+
+  private extractPathsFromSearchResult(message: string): string[] {
+    const lines = message.split(/\r?\n/g);
+    const paths: string[] = [];
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line.startsWith("Search results") || line.startsWith("Potential related files") || line.startsWith("...<truncated>")) {
+        continue;
+      }
+      const firstColon = line.indexOf(":");
+      const candidate = firstColon > 0 ? line.slice(0, firstColon) : line;
+      if (!candidate.includes("/") && !candidate.includes(".")) {
+        continue;
+      }
+      paths.push(candidate.trim());
+    }
+    return Array.from(new Set(paths)).slice(0, 120);
+  }
+
+  private buildReadSummaryFromToolMessage(message: string): string {
+    const lines = message.split(/\r?\n/g).slice(1);
+    const signals: string[] = [];
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) {
+        continue;
+      }
+      if (
+        /\b(class|enum|typedef|extension|mixin|abstract\s+class|void|Future<|Future\s+|Widget|State<|testWidgets|group\(|test\(|it\(|expect\()/.test(
+          line
+        )
+      ) {
+        signals.push(line.replace(/\s+/g, " "));
+      }
+      if (signals.length >= 3) {
+        break;
+      }
+    }
+    if (signals.length === 0) {
+      const first = lines.map((line) => line.trim()).find((line) => line.length > 0) ?? "";
+      return truncate(first.replace(/\s+/g, " "), 140);
+    }
+    return truncate(signals.join(" | "), 180);
   }
 
   private isLikelyTruncatedWritePayload(rawResponse: string, parseErrorMessage: string): boolean {
@@ -1796,7 +2979,9 @@ export class LocalAgentRunner {
     const looksTruncated =
       lowerError.includes("unterminated string") ||
       lowerError.includes("unexpected end of json") ||
-      lowerError.includes("end of json input");
+      lowerError.includes("end of json input") ||
+      lowerError.includes("expected ',' or ']'") ||
+      lowerError.includes("expected ',' or '}'");
     if (!looksTruncated) {
       return false;
     }
@@ -1815,6 +3000,21 @@ export class LocalAgentRunner {
   private resolveWriteContent(action: AgentAction): string | undefined {
     if (typeof action.content === "string") {
       return action.content;
+    }
+    if (typeof action.code === "string") {
+      return action.code;
+    }
+    if (typeof action.text === "string") {
+      return action.text;
+    }
+    if (typeof action.file_content === "string") {
+      return action.file_content;
+    }
+    if (typeof action.fileContent === "string") {
+      return action.fileContent;
+    }
+    if (typeof action.body === "string") {
+      return action.body;
     }
 
     const linesRaw = action.content_lines ?? action.contentLines;
@@ -1884,17 +3084,19 @@ export class LocalAgentRunner {
 
       if (!existsBeforeWrite && options.mode === "overwrite") {
         const duplicateCandidates = await this.findLikelyDuplicateFiles(relPath);
-        if (!options.allowDuplicate && duplicateCandidates.length > 0) {
+        const blockingDuplicateCandidates = this.selectBlockingDuplicateCandidates(relPath, duplicateCandidates);
+        if (!options.allowDuplicate && blockingDuplicateCandidates.length > 0) {
           return {
             kind: "tool",
             message: [
               `DuplicateGuard: creating '${relPath}' may duplicate existing files.`,
-              `Potential duplicates: ${duplicateCandidates.join(", ")}`,
+              `Potential duplicates: ${blockingDuplicateCandidates.join(", ")}`,
               "If this is truly a separate file, set allowDuplicate=true. Otherwise edit existing file."
             ].join(" "),
             progress: false
           };
         }
+        // Non-blocking duplicate hints are ignored by design.
       }
 
       let finalContent = content;
@@ -2082,12 +3284,34 @@ export class LocalAgentRunner {
       const roots = await this.getProjectFirstRoots();
       const preferredTargets = roots.length > 0 ? roots : ["."]; // keep search local to source first
       const preferred = await this.runRipgrep(pattern, limit, preferredTargets);
-      if (preferred.length >= limit || preferredTargets[0] === ".") {
-        return this.sortSearchResultsByPriority(preferred).slice(0, limit);
+      const merged = new Set<string>(preferred);
+
+      if (preferred.length === 0) {
+        const alternatives = this.buildSearchPatternAlternatives(pattern);
+        for (const alternative of alternatives) {
+          if (!alternative || alternative === pattern) {
+            continue;
+          }
+          const altHits = await this.runRipgrep(alternative, limit, preferredTargets);
+          for (const item of altHits) {
+            if (this.isFrameworkOrGeneratedSearchResult(item)) {
+              continue;
+            }
+            merged.add(item);
+            if (merged.size >= limit) {
+              break;
+            }
+          }
+          if (merged.size >= limit) {
+            break;
+          }
+        }
+      }
+      if (merged.size >= limit || preferredTargets[0] === ".") {
+        return this.sortSearchResultsByPriority(Array.from(merged.values())).slice(0, limit);
       }
 
       const fallback = await this.runRipgrep(pattern, limit, ["."]);
-      const merged = new Set<string>(preferred);
       for (const item of fallback) {
         if (this.isFrameworkOrGeneratedSearchResult(item)) {
           continue;
@@ -2478,6 +3702,8 @@ export class LocalAgentRunner {
     const targetExt = path.extname(targetRelPath).toLowerCase();
     const targetBase = path.basename(targetRelPath).toLowerCase();
     const targetTokens = this.getFileNameTokens(targetBase);
+    const targetIsTest = this.isLikelyTestFile(targetRelPath.toLowerCase());
+    const targetTopLevel = this.getTopLevelSegment(targetRelPath);
     const targetDir = path.posix.dirname(targetRelPath);
     if (targetTokens.length === 0) {
       return [];
@@ -2491,6 +3717,13 @@ export class LocalAgentRunner {
 
       const fileExt = path.extname(file).toLowerCase();
       if (targetExt && fileExt && targetExt !== fileExt) {
+        continue;
+      }
+      const candidateIsTest = this.isLikelyTestFile(file.toLowerCase());
+      if (targetIsTest !== candidateIsTest) {
+        continue;
+      }
+      if (targetIsTest && this.getTopLevelSegment(file) !== targetTopLevel) {
         continue;
       }
 
@@ -2514,6 +3747,115 @@ export class LocalAgentRunner {
       .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
       .slice(0, DUPLICATE_GUARD_LIMIT)
       .map((entry) => entry.file);
+  }
+
+  private selectBlockingDuplicateCandidates(targetRelPath: string, candidates: string[]): string[] {
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const targetLower = targetRelPath.toLowerCase();
+    const targetIsTest = this.isLikelyTestFile(targetLower);
+    const targetTopLevel = this.getTopLevelSegment(targetLower);
+    const targetStem = this.getDuplicateComparableStem(path.basename(targetLower));
+
+    return candidates.filter((candidate) => {
+      const candidateLower = candidate.toLowerCase();
+      if (candidateLower === targetLower) {
+        return false;
+      }
+      const candidateIsTest = this.isLikelyTestFile(candidateLower);
+      if (targetIsTest !== candidateIsTest) {
+        return false;
+      }
+
+      if (targetIsTest && this.getTopLevelSegment(candidateLower) !== targetTopLevel) {
+        return false;
+      }
+
+      const candidateStem = this.getDuplicateComparableStem(path.basename(candidateLower));
+      if (!targetStem || !candidateStem) {
+        return false;
+      }
+
+      return (
+        candidateStem === targetStem ||
+        candidateStem.includes(targetStem) ||
+        targetStem.includes(candidateStem)
+      );
+    });
+  }
+
+  private getDuplicateComparableStem(fileName: string): string {
+    return fileName
+      .toLowerCase()
+      .replace(/\.[^.]+$/, "")
+      .replace(/(?:_test|\.test|\.spec)$/g, "")
+      .replace(/[^a-z0-9]+/g, "");
+  }
+
+  private getTopLevelSegment(relPath: string): string {
+    const normalized = relPath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+    const parts = normalized.split("/");
+    return (parts[0] || "").toLowerCase();
+  }
+
+  private splitComparableTokens(value: string): string[] {
+    const normalized = value
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ");
+    return normalized
+      .split(/\s+/g)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 2);
+  }
+
+  private buildSearchTermVariants(term: string): string[] {
+    const seed = term.trim().toLowerCase();
+    if (!seed) {
+      return [];
+    }
+    const tokens = this.splitComparableTokens(seed).filter((token) => token.length >= 3);
+    const out = new Set<string>();
+    out.add(seed);
+    if (tokens.length > 0) {
+      tokens.forEach((token) => out.add(token));
+      out.add(tokens.join("_"));
+      out.add(tokens.join("-"));
+      out.add(tokens.join(""));
+    }
+    if (tokens.length >= 2) {
+      const reversed = [...tokens].reverse();
+      out.add(reversed.join("_"));
+      out.add(reversed.join("-"));
+      out.add(reversed.join(""));
+    }
+    return Array.from(out.values()).filter((item) => item.length >= 3);
+  }
+
+  private buildSearchPatternAlternatives(pattern: string): string[] {
+    const terms = this.extractSearchTerms(pattern).slice(0, 5);
+    const alternatives = new Set<string>();
+    for (const term of terms) {
+      for (const variant of this.buildSearchTermVariants(term)) {
+        const escaped = this.escapeRegexTerm(variant);
+        if (escaped.length >= 3) {
+          alternatives.add(escaped);
+        }
+        if (alternatives.size >= 10) {
+          break;
+        }
+      }
+      if (alternatives.size >= 10) {
+        break;
+      }
+    }
+    return Array.from(alternatives.values());
+  }
+
+  private escapeRegexTerm(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   private getFileNameTokens(fileName: string): string[] {
@@ -2546,15 +3888,36 @@ export class LocalAgentRunner {
       return [];
     }
 
+    const expandedTerms = Array.from(
+      new Set(terms.flatMap((term) => this.buildSearchTermVariants(term)))
+    ).slice(0, 20);
     const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
     const scored: Array<{ file: string; score: number }> = [];
 
     for (const file of files) {
       const lower = file.toLowerCase();
+      const fileTokens = new Set(this.splitComparableTokens(lower));
       let score = 0;
-      for (const term of terms) {
+      for (const term of expandedTerms) {
         if (lower.includes(term)) {
-          score += term.length;
+          score += Math.min(16, term.length);
+        }
+      }
+      for (const term of terms) {
+        const termTokens = this.splitComparableTokens(term).filter((token) => token.length >= 3);
+        if (termTokens.length === 0) {
+          continue;
+        }
+        let matched = 0;
+        for (const token of termTokens) {
+          if (fileTokens.has(token)) {
+            matched += 1;
+          }
+        }
+        if (matched === termTokens.length && termTokens.length >= 2) {
+          score += 24 + termTokens.length * 3;
+        } else if (matched > 0) {
+          score += matched * 6;
         }
       }
       if (score > 0) {
@@ -2583,12 +3946,24 @@ export class LocalAgentRunner {
       "file",
       "code",
       "component",
-      "page"
+      "page",
+      "integration",
+      "test",
+      "widget",
+      "unit"
     ]);
     const terms = [...quoted, ...direct]
       .map((term) => term.trim().toLowerCase())
       .filter((term) => term.length >= 3 && !stopWords.has(term));
-    return Array.from(new Set(terms));
+    const expanded = new Set<string>();
+    for (const term of terms) {
+      for (const variant of this.buildSearchTermVariants(term)) {
+        if (variant.length >= 3 && !stopWords.has(variant)) {
+          expanded.add(variant);
+        }
+      }
+    }
+    return Array.from(expanded.values());
   }
 
   private async collectWorkspaceSnapshot(options: WorkspaceSnapshotOptions): Promise<string> {
@@ -2674,6 +4049,409 @@ export class LocalAgentRunner {
     return undefined;
   }
 
+  private async enrichTaskScopeWithWorkspace(scope: TaskScopeProfile): Promise<void> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const commands = new Set<string>(scope.commandHints);
+
+    if (files.includes("pubspec.yaml")) {
+      commands.add("flutter analyze");
+      if (scope.isTestTask) {
+        commands.add("flutter test");
+      }
+    }
+
+    if (files.includes("package.json")) {
+      const npmHints = await this.readNpmScriptHints();
+      npmHints.forEach((hint) => commands.add(hint));
+      if (scope.isTestTask && npmHints.length === 0) {
+        commands.add("npm test -- --runInBand");
+      }
+    }
+
+    if (files.includes("pytest.ini") || files.includes("pyproject.toml")) {
+      commands.add("pytest -q");
+    }
+    if (files.includes("go.mod")) {
+      commands.add("go test ./...");
+    }
+    if (files.includes("Cargo.toml")) {
+      commands.add("cargo test");
+    }
+
+    const testRoots = new Set<string>();
+    for (const file of files) {
+      if (!this.isLikelyTestFile(file.toLowerCase())) {
+        continue;
+      }
+      testRoots.add(this.getTopLevelSegment(file));
+      if (testRoots.size >= 4) {
+        break;
+      }
+    }
+    if (scope.isTestTask && testRoots.size > 0) {
+      scope.requirementChecklist.push(
+        `Keep test files inside existing test roots: ${Array.from(testRoots.values()).join(", ")}.`
+      );
+    }
+
+    scope.commandHints = Array.from(commands.values()).slice(0, 8);
+  }
+
+  private async readNpmScriptHints(): Promise<string[]> {
+    try {
+      const packageJsonPath = this.resolveWorkspacePath("package.json");
+      const raw = await fs.readFile(packageJsonPath, "utf8");
+      const parsed = JSON.parse(raw) as { scripts?: Record<string, string> };
+      const scripts = parsed.scripts ?? {};
+      const candidates = ["test", "test:unit", "test:integration", "lint", "typecheck", "build"];
+      const out: string[] = [];
+      for (const name of candidates) {
+        if (typeof scripts[name] === "string" && scripts[name].trim().length > 0) {
+          out.push(`npm run ${name}`);
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  private async refreshProjectTechProfile(): Promise<void> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const hasFile = (file: string): boolean => files.includes(file);
+    const languages = new Set<string>();
+    const frameworks = new Set<string>();
+    const versions = new Set<string>();
+    const evidence: string[] = [];
+
+    if (hasFile("package.json")) {
+      evidence.push("package.json");
+      try {
+        const raw = await fs.readFile(this.resolveWorkspacePath("package.json"), "utf8");
+        const pkg = JSON.parse(raw) as {
+          engines?: Record<string, unknown>;
+          dependencies?: Record<string, unknown>;
+          devDependencies?: Record<string, unknown>;
+        };
+        const deps: Record<string, string> = {};
+        for (const [name, value] of Object.entries(pkg.dependencies ?? {})) {
+          deps[name] = String(value ?? "");
+        }
+        for (const [name, value] of Object.entries(pkg.devDependencies ?? {})) {
+          if (!(name in deps)) {
+            deps[name] = String(value ?? "");
+          }
+        }
+
+        if (hasFile("tsconfig.json") || "typescript" in deps) {
+          languages.add("TypeScript");
+        } else {
+          languages.add("JavaScript");
+        }
+
+        const nodeVersion = pkg.engines?.node;
+        if (typeof nodeVersion === "string" && nodeVersion.trim()) {
+          versions.add(`Node ${nodeVersion.trim()}`);
+        }
+
+        for (const item of this.detectJsFrameworksFromDependencies(deps)) {
+          frameworks.add(item.name);
+          if (item.version) {
+            versions.add(`${item.name} ${item.version}`);
+          }
+        }
+      } catch {
+        // Ignore invalid package.json and continue with other manifests.
+      }
+    }
+
+    if (hasFile("pubspec.yaml")) {
+      evidence.push("pubspec.yaml");
+      languages.add("Dart");
+      try {
+        const raw = await fs.readFile(this.resolveWorkspacePath("pubspec.yaml"), "utf8");
+        if (/^\s*flutter\s*:/m.test(raw) || /^\s*sdk\s*:\s*flutter/m.test(raw)) {
+          frameworks.add("Flutter");
+        }
+        const dartSdkMatch = raw.match(/environment\s*:\s*[\s\S]*?\n\s*sdk\s*:\s*['"]?([^'"\n]+)['"]?/m);
+        if (dartSdkMatch?.[1]) {
+          versions.add(`Dart SDK ${dartSdkMatch[1].trim()}`);
+        }
+      } catch {
+        // Ignore read failure.
+      }
+    }
+
+    if (hasFile(".fvm/fvm_config.json")) {
+      evidence.push(".fvm/fvm_config.json");
+      try {
+        const raw = await fs.readFile(this.resolveWorkspacePath(".fvm/fvm_config.json"), "utf8");
+        const cfg = JSON.parse(raw) as Record<string, unknown>;
+        const flutterVersion =
+          typeof cfg.flutterSdkVersion === "string"
+            ? cfg.flutterSdkVersion
+            : typeof cfg.flutterSdkVersionName === "string"
+              ? cfg.flutterSdkVersionName
+              : "";
+        if (flutterVersion.trim()) {
+          frameworks.add("Flutter");
+          versions.add(`Flutter ${flutterVersion.trim()}`);
+        }
+      } catch {
+        // Ignore invalid FVM config.
+      }
+    }
+
+    if (hasFile("go.mod")) {
+      evidence.push("go.mod");
+      languages.add("Go");
+      try {
+        const raw = await fs.readFile(this.resolveWorkspacePath("go.mod"), "utf8");
+        const goMatch = raw.match(/^\s*go\s+([0-9.]+)/m);
+        if (goMatch?.[1]) {
+          versions.add(`Go ${goMatch[1]}`);
+        }
+      } catch {
+        // Ignore read failure.
+      }
+    }
+
+    if (hasFile("Cargo.toml")) {
+      evidence.push("Cargo.toml");
+      languages.add("Rust");
+      try {
+        const raw = await fs.readFile(this.resolveWorkspacePath("Cargo.toml"), "utf8");
+        const editionMatch = raw.match(/^\s*edition\s*=\s*"([^"]+)"/m);
+        const rustVersionMatch = raw.match(/^\s*rust-version\s*=\s*"([^"]+)"/m);
+        if (editionMatch?.[1]) {
+          versions.add(`Rust edition ${editionMatch[1]}`);
+        }
+        if (rustVersionMatch?.[1]) {
+          versions.add(`Rust ${rustVersionMatch[1]}`);
+        }
+      } catch {
+        // Ignore read failure.
+      }
+    }
+
+    if (hasFile("pyproject.toml") || hasFile("requirements.txt")) {
+      languages.add("Python");
+      if (hasFile("pyproject.toml")) {
+        evidence.push("pyproject.toml");
+        try {
+          const raw = await fs.readFile(this.resolveWorkspacePath("pyproject.toml"), "utf8");
+          const requiresPython = raw.match(/requires-python\s*=\s*"([^"]+)"/i)?.[1];
+          if (requiresPython) {
+            versions.add(`Python ${requiresPython}`);
+          }
+          if (/\bfastapi\b/i.test(raw)) {
+            frameworks.add("FastAPI");
+          }
+          if (/\bdjango\b/i.test(raw)) {
+            frameworks.add("Django");
+          }
+          if (/\bflask\b/i.test(raw)) {
+            frameworks.add("Flask");
+          }
+        } catch {
+          // Ignore read failure.
+        }
+      }
+      if (hasFile("requirements.txt")) {
+        evidence.push("requirements.txt");
+        try {
+          const raw = await fs.readFile(this.resolveWorkspacePath("requirements.txt"), "utf8");
+          if (/\bfastapi\b/i.test(raw)) {
+            frameworks.add("FastAPI");
+          }
+          if (/\bdjango\b/i.test(raw)) {
+            frameworks.add("Django");
+          }
+          if (/\bflask\b/i.test(raw)) {
+            frameworks.add("Flask");
+          }
+        } catch {
+          // Ignore read failure.
+        }
+      }
+    }
+
+    if (hasFile("pom.xml")) {
+      evidence.push("pom.xml");
+      languages.add("Java");
+      frameworks.add("Spring");
+    }
+
+    if (hasFile("build.gradle") || hasFile("build.gradle.kts")) {
+      evidence.push(hasFile("build.gradle.kts") ? "build.gradle.kts" : "build.gradle");
+      if (!languages.has("Java")) {
+        languages.add("Kotlin/Java");
+      }
+    }
+
+    if (languages.size === 0) {
+      const inferred = this.inferLanguagesFromFileExtensions(files);
+      inferred.forEach((item) => languages.add(item));
+      if (inferred.length > 0) {
+        evidence.push("file-extension-scan");
+      }
+    }
+
+    const languageList = Array.from(languages.values()).slice(0, 8);
+    const frameworkList = Array.from(frameworks.values()).slice(0, 8);
+    const versionList = Array.from(versions.values()).slice(0, 12);
+    const evidenceList = Array.from(new Set(evidence)).slice(0, 10);
+
+    this.projectTechProfile = {
+      languages: languageList.length > 0 ? languageList : ["unknown"],
+      frameworks: frameworkList.length > 0 ? frameworkList : ["unknown"],
+      versions: versionList,
+      evidence: evidenceList,
+      summary: [
+        `languages=${languageList.length > 0 ? languageList.join(", ") : "unknown"}`,
+        `frameworks=${frameworkList.length > 0 ? frameworkList.join(", ") : "unknown"}`,
+        `versions=${versionList.length > 0 ? versionList.join(", ") : "unknown"}`,
+        `evidence=${evidenceList.length > 0 ? evidenceList.join(", ") : "none"}`
+      ].join("; ")
+    };
+  }
+
+  private detectJsFrameworksFromDependencies(
+    deps: Record<string, string>
+  ): Array<{ name: string; version: string }> {
+    const map: Array<{ dep: string; label: string }> = [
+      { dep: "react", label: "React" },
+      { dep: "next", label: "Next.js" },
+      { dep: "vue", label: "Vue" },
+      { dep: "nuxt", label: "Nuxt" },
+      { dep: "@angular/core", label: "Angular" },
+      { dep: "svelte", label: "Svelte" },
+      { dep: "solid-js", label: "SolidJS" },
+      { dep: "@nestjs/core", label: "NestJS" },
+      { dep: "express", label: "Express" },
+      { dep: "fastify", label: "Fastify" },
+      { dep: "koa", label: "Koa" }
+    ];
+    const out: Array<{ name: string; version: string }> = [];
+    for (const item of map) {
+      const version = deps[item.dep];
+      if (typeof version === "string" && version.trim()) {
+        out.push({ name: item.label, version: version.trim() });
+      }
+    }
+    return out;
+  }
+
+  private inferLanguagesFromFileExtensions(files: string[]): string[] {
+    const counts = new Map<string, number>();
+    const map: Record<string, string> = {
+      ".ts": "TypeScript",
+      ".tsx": "TypeScript",
+      ".js": "JavaScript",
+      ".jsx": "JavaScript",
+      ".dart": "Dart",
+      ".py": "Python",
+      ".go": "Go",
+      ".rs": "Rust",
+      ".java": "Java",
+      ".kt": "Kotlin",
+      ".swift": "Swift",
+      ".php": "PHP",
+      ".rb": "Ruby",
+      ".cs": "C#",
+      ".cpp": "C++",
+      ".cc": "C++",
+      ".cxx": "C++",
+      ".c": "C"
+    };
+
+    for (const file of files.slice(0, 3000)) {
+      const ext = path.extname(file).toLowerCase();
+      const language = map[ext];
+      if (!language) {
+        continue;
+      }
+      counts.set(language, (counts.get(language) ?? 0) + 1);
+    }
+
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 4)
+      .map(([language]) => language);
+  }
+
+  private formatProjectTechProfileForPrompt(): string {
+    const profile = this.projectTechProfile;
+    return [
+      `Languages: ${profile.languages.join(", ")}`,
+      `Frameworks: ${profile.frameworks.join(", ")}`,
+      `Versions: ${profile.versions.length > 0 ? profile.versions.join(" | ") : "unknown"}`,
+      `Evidence: ${profile.evidence.length > 0 ? profile.evidence.join(", ") : "none"}`
+    ].join("\n");
+  }
+
+  private async suggestVerificationCommand(): Promise<string | undefined> {
+    const scope = this.currentTaskScope;
+    const changed = Array.from(this.changedFiles.values());
+    const changedTests = changed.filter((file) => this.isLikelyTestFile(file.toLowerCase()));
+    const isTestFlow = (scope?.isTestTask ?? false) || changedTests.length > 0;
+
+    const scopeHints = scope?.commandHints ?? [];
+    for (const hint of scopeHints) {
+      const normalized = hint.trim();
+      if (!normalized) {
+        continue;
+      }
+      if (
+        /^(npm run |pnpm |yarn |flutter |fvm flutter |pytest\b|go test\b|cargo test\b)/i.test(normalized)
+      ) {
+        return normalized;
+      }
+    }
+
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const hasFile = (name: string): boolean => files.includes(name);
+    const hasFlutter = hasFile("pubspec.yaml");
+    if (hasFlutter) {
+      const hasFvm = hasFile(".fvm/fvm_config.json");
+      const flutterCmd = hasFvm ? "fvm flutter" : "flutter";
+      if (isTestFlow) {
+        if (changedTests.length > 0) {
+          const target = changedTests[0];
+          return `${flutterCmd} test ${target}`;
+        }
+        return `${flutterCmd} test`;
+      }
+      return `${flutterCmd} analyze --no-fatal-infos`;
+    }
+
+    if (hasFile("package.json")) {
+      const npmHints = await this.readNpmScriptHints();
+      if (isTestFlow) {
+        const preferred =
+          npmHints.find((item) => /test:integration|test:unit|test\b/.test(item)) ??
+          npmHints.find((item) => /lint|typecheck/.test(item));
+        if (preferred) {
+          return preferred;
+        }
+        return "npm test -- --runInBand";
+      }
+      return npmHints[0] ?? "npm run lint";
+    }
+
+    if (hasFile("pytest.ini") || hasFile("pyproject.toml")) {
+      return isTestFlow ? "pytest -q" : "pytest -q";
+    }
+    if (hasFile("go.mod")) {
+      return "go test ./...";
+    }
+    if (hasFile("Cargo.toml")) {
+      return "cargo test";
+    }
+
+    return undefined;
+  }
+
   private buildTaskScope(task: string): TaskScopeProfile {
     const primaryTask = this.extractPrimaryTaskText(task);
     const lower = primaryTask.toLowerCase();
@@ -2689,7 +4467,15 @@ export class LocalAgentRunner {
       /\bfrom\s+scratch\b/.test(lower) ||
       /\bnew\s+architecture\b/.test(lower);
     const focusTerms = this.extractTaskFocusTerms(primaryTask, 8);
+    const requestedTestTypes = this.inferRequestedTestTypes(primaryTask, isTestTask);
+    const intentLabels = this.inferIntentLabels(primaryTask, isTestTask, allowRewrite);
     const scopeClass = this.classifyScope(primaryTask, isTestTask, allowRewrite, focusTerms.length);
+    const requirementComplexity = this.estimateRequirementComplexity(
+      primaryTask,
+      scopeClass,
+      focusTerms,
+      requestedTestTypes
+    );
     const maxChangedFilesByScope: Record<ScopeClass, number> = {
       micro: 4,
       small: 7,
@@ -2703,10 +4489,25 @@ export class LocalAgentRunner {
     }
 
     const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "explicit modules from the request";
+    const expectedDeliverables = this.buildExpectedDeliverables(
+      primaryTask,
+      isTestTask,
+      focusTerms,
+      requestedTestTypes
+    );
+    const commandHints = this.buildCommandHintsFromTask(primaryTask, isTestTask, requestedTestTypes);
+    const requirementChecklist = this.buildRequirementChecklist(
+      primaryTask,
+      isTestTask,
+      focusTerms,
+      requestedTestTypes,
+      intentLabels
+    );
     const primaryObjective = this.buildPrimaryObjective(primaryTask, isTestTask, focusTerms);
     const contract = [
       `- Primary objective: ${primaryObjective}`,
       `- Scope class: ${scopeClass}.`,
+      `- Requirement complexity: ${requirementComplexity}/5.`,
       `- Maximum changed files target: ${maxChangedFiles}.`,
       allowRewrite
         ? "- Broad refactor is explicitly allowed only if required by the request."
@@ -2714,7 +4515,12 @@ export class LocalAgentRunner {
       isTestTask
         ? "- Primary deliverable is test code. Prefer test directories and *test/*spec files."
         : "- Prefer minimal edits in existing files closest to the requested behavior.",
+      `- Intent labels inferred: ${intentLabels.join(", ") || "general implementation"}.`,
+      requestedTestTypes.length > 0
+        ? `- Requested test types: ${requestedTestTypes.join(", ")}.`
+        : "- Requested test types: none explicitly specified.",
       `- Keep edits focused on: ${focusLabel}.`,
+      "- Before execution, analyze requirement details: deliverables, constraints, dependencies, and verification commands.",
       "- If a proposed step is broad, shrink it to the smallest valid implementation."
     ];
 
@@ -2723,11 +4529,195 @@ export class LocalAgentRunner {
       scopeClass,
       isTestTask,
       allowRewrite,
+      requirementComplexity,
       maxChangedFiles,
       focusTerms,
+      intentLabels,
+      requestedTestTypes,
+      expectedDeliverables,
+      commandHints,
+      requirementChecklist,
       primaryObjective,
       contract
     };
+  }
+
+  private inferRequestedTestTypes(task: string, isTestTask: boolean): string[] {
+    if (!isTestTask) {
+      return [];
+    }
+    const lower = task.toLowerCase();
+    const out: string[] = [];
+    if (/\bintegration\s+test\b/.test(lower)) {
+      out.push("integration");
+    }
+    if (/\bwidget\s+test\b/.test(lower)) {
+      out.push("widget");
+    }
+    if (/\bunit\s+test\b/.test(lower)) {
+      out.push("unit");
+    }
+    if (/\be2e\b|\bend[-\s]?to[-\s]?end\b/.test(lower)) {
+      out.push("e2e");
+    }
+    if (out.length === 0) {
+      out.push("test");
+    }
+    return out;
+  }
+
+  private inferIntentLabels(task: string, isTestTask: boolean, allowRewrite: boolean): string[] {
+    const lower = task.toLowerCase();
+    const out = new Set<string>();
+    if (isTestTask) {
+      out.add("testing");
+    }
+    if (/\bfix\b|\bbug\b|\berror\b|\bfail\b/.test(lower)) {
+      out.add("bugfix");
+    }
+    if (/\brefactor\b|\bclean\s*up\b|\brestructure\b/.test(lower)) {
+      out.add("refactor");
+    }
+    if (/\boptimiz\b|\bperformance\b|\bperf\b/.test(lower)) {
+      out.add("optimization");
+    }
+    if (/\bdocument\b|\breadme\b|\bdoc\b/.test(lower)) {
+      out.add("documentation");
+    }
+    if (/\bui\b|\bux\b|\bscreen\b|\bpage\b|\bwidget\b/.test(lower)) {
+      out.add("ui");
+    }
+    if (/\bapi\b|\bendpoint\b|\bintegration\b/.test(lower)) {
+      out.add("integration");
+    }
+    if (/\bdebug\b|\binvestigate\b|\banalyze\b/.test(lower)) {
+      out.add("analysis");
+    }
+    if (allowRewrite) {
+      out.add("rewrite");
+    }
+    if (out.size === 0) {
+      out.add("implementation");
+    }
+    return Array.from(out.values()).slice(0, 6);
+  }
+
+  private estimateRequirementComplexity(
+    task: string,
+    scopeClass: ScopeClass,
+    focusTerms: string[],
+    requestedTestTypes: string[]
+  ): number {
+    let score = scopeClass === "broad" ? 5 : scopeClass === "medium" ? 4 : scopeClass === "small" ? 3 : 2;
+    if (focusTerms.length >= 4) {
+      score += 1;
+    }
+    if (requestedTestTypes.length >= 2) {
+      score += 1;
+    }
+    if (/\band\b|\balso\b|,/.test(task.toLowerCase())) {
+      score += 1;
+    }
+    return Math.max(1, Math.min(5, score));
+  }
+
+  private buildExpectedDeliverables(
+    task: string,
+    isTestTask: boolean,
+    focusTerms: string[],
+    requestedTestTypes: string[]
+  ): string[] {
+    const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "requested target";
+    const out: string[] = [];
+    if (isTestTask) {
+      const testTypeLabel = requestedTestTypes.join(", ");
+      out.push(`Test file updates for ${focusLabel} (${testTypeLabel}).`);
+      out.push("Assertions for success/edge/error states relevant to requirement.");
+      out.push("Verification command executed with result summary.");
+      return out;
+    }
+
+    out.push(`Implementation updates limited to ${focusLabel}.`);
+    if (/\bfix\b|\bbug\b|\berror\b|\bfail\b/.test(task.toLowerCase())) {
+      out.push("Root-cause fix with no unrelated feature changes.");
+    }
+    if (/\bui\b|\bux\b|\bscreen\b|\bpage\b/.test(task.toLowerCase())) {
+      out.push("UI behavior matches requested scenario and existing structure.");
+    }
+    out.push("Verification command executed with result summary.");
+    return out.slice(0, 5);
+  }
+
+  private buildCommandHintsFromTask(
+    task: string,
+    isTestTask: boolean,
+    requestedTestTypes: string[]
+  ): string[] {
+    const lower = task.toLowerCase();
+    const hints = new Set<string>();
+    if (isTestTask) {
+      if (requestedTestTypes.includes("integration")) {
+        hints.add("Run targeted integration tests");
+      }
+      if (requestedTestTypes.includes("widget")) {
+        hints.add("Run targeted widget tests");
+      }
+      if (requestedTestTypes.includes("unit")) {
+        hints.add("Run targeted unit tests");
+      }
+      hints.add("Run relevant test command for changed scope");
+    }
+    if (/\blint\b/.test(lower)) {
+      hints.add("Run lint command");
+    }
+    if (/\btypecheck\b|\btype check\b|\btyping\b/.test(lower)) {
+      hints.add("Run typecheck command");
+    }
+    if (!isTestTask) {
+      hints.add("Run the nearest verification command (test/lint/typecheck/build)");
+    }
+    return Array.from(hints.values()).slice(0, 6);
+  }
+
+  private buildRequirementChecklist(
+    task: string,
+    isTestTask: boolean,
+    focusTerms: string[],
+    requestedTestTypes: string[],
+    intentLabels: string[]
+  ): string[] {
+    const focusLabel = focusTerms.length > 0 ? focusTerms.join(", ") : "requested target";
+    const checklist: string[] = [
+      `Clarify exact deliverables from request text for ${focusLabel}.`,
+      "Mandatory preflight: identify project language, framework, and versions from manifest files before coding.",
+      "Identify constraints, exclusions, and scope boundaries before editing.",
+      "Inspect related existing files/patterns before creating new files.",
+      "Choose verification command(s) before finalizing changes."
+    ];
+
+    if (isTestTask) {
+      checklist.push(
+        `Determine test style/type (${requestedTestTypes.join(", ")}) from existing project tests before writing.`
+      );
+      checklist.push("Map required scenarios: happy path, edge cases, and failure states from requirement.");
+    }
+
+    if (intentLabels.includes("bugfix")) {
+      checklist.push("Confirm root cause in current code path before applying fix.");
+    }
+    if (intentLabels.includes("ui")) {
+      checklist.push("Check UI structure/state flow to align behavior with current screen architecture.");
+    }
+    if (intentLabels.includes("integration")) {
+      checklist.push("Trace dependent services/providers/controllers needed by the requested flow.");
+    }
+
+    const lower = task.toLowerCase();
+    if (/\bcommand\b|\bcâu lệnh\b|\brun\b|\bcli\b/.test(lower)) {
+      checklist.push("Explicitly list and execute required commands requested by the user.");
+    }
+
+    return Array.from(new Set(checklist)).slice(0, 9);
   }
 
   private buildPrimaryObjective(primaryTask: string, isTestTask: boolean, focusTerms: string[]): string {
@@ -3013,6 +5003,17 @@ export class LocalAgentRunner {
         ].join(" ");
       }
 
+      const knownTestRoots = await this.getKnownTestRoots();
+      if (
+        knownTestRoots.length > 0 &&
+        !knownTestRoots.some((root) => lowerPath === root || lowerPath.startsWith(`${root}/`))
+      ) {
+        return [
+          `ScopeGuard: '${relPath}' is outside known test roots (${knownTestRoots.join(", ")}).`,
+          "Create/update tests inside existing test roots to follow project structure."
+        ].join(" ");
+      }
+
       const knownTestDirs = await this.getKnownTestDirectories();
       if (
         !touchesFocus &&
@@ -3116,6 +5117,21 @@ export class LocalAgentRunner {
     return Array.from(dirs).sort((a, b) => a.localeCompare(b)).slice(0, 30);
   }
 
+  private async getKnownTestRoots(): Promise<string[]> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const roots = new Set<string>();
+    for (const file of files) {
+      if (!this.isLikelyTestFile(file.toLowerCase())) {
+        continue;
+      }
+      const root = this.getTopLevelSegment(file);
+      if (root) {
+        roots.add(root);
+      }
+    }
+    return Array.from(roots).sort((a, b) => a.localeCompare(b)).slice(0, 6);
+  }
+
   private async findRelatedExistingTestFiles(focusTerms: string[], limit: number): Promise<string[]> {
     if (!Array.isArray(focusTerms) || focusTerms.length === 0) {
       return [];
@@ -3194,7 +5210,33 @@ export class LocalAgentRunner {
       return false;
     }
     const lower = textOrPath.toLowerCase();
-    return focusTerms.some((term) => term.length >= 3 && lower.includes(term.toLowerCase()));
+    const compact = lower.replace(/[^a-z0-9]+/g, "");
+    const textTokens = new Set(this.splitComparableTokens(lower).filter((token) => token.length >= 3));
+
+    for (const term of focusTerms) {
+      const normalized = term.trim().toLowerCase();
+      if (normalized.length < 3) {
+        continue;
+      }
+
+      if (lower.includes(normalized)) {
+        return true;
+      }
+
+      const termCompact = normalized.replace(/[^a-z0-9]+/g, "");
+      if (termCompact.length >= 4 && compact.includes(termCompact)) {
+        return true;
+      }
+
+      const termTokens = this.splitComparableTokens(normalized).filter((token) => token.length >= 3);
+      if (termTokens.length === 0) {
+        continue;
+      }
+      if (termTokens.every((token) => textTokens.has(token))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private isLikelyTestFile(relativePathLower: string): boolean {
@@ -3274,21 +5316,244 @@ export class LocalAgentRunner {
   }
 
   private parseDecision(raw: string): AgentDecision {
-    const parsed = extractJsonObject(raw);
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("Decision is not an object.");
+    try {
+      const parsed = extractJsonObject(raw);
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error("Decision is not an object.");
+      }
+
+      const decision = parsed as Record<string, unknown>;
+      const action = this.extractActionFromDecision(decision);
+      if (!action) {
+        throw new Error("Decision missing usable action.");
+      }
+
+      return {
+        reasoning: toStringValue(decision.reasoning, ""),
+        action
+      };
+    } catch (error) {
+      const fallback = this.tryParseDecisionHeuristic(raw);
+      if (fallback) {
+        return fallback;
+      }
+      throw error;
+    }
+  }
+
+  private tryParseDecisionHeuristic(raw: string): AgentDecision | undefined {
+    const text = raw.trim();
+    if (!text) {
+      return undefined;
     }
 
-    const decision = parsed as Record<string, unknown>;
-    const action = this.extractActionFromDecision(decision);
-    if (!action) {
-      throw new Error("Decision missing usable action.");
+    const actionType = this.detectActionTypeFromText(text);
+    if (!actionType) {
+      return undefined;
     }
 
-    return {
-      reasoning: toStringValue(decision.reasoning, ""),
-      action
-    };
+    const normalizedType = this.normalizeActionType(actionType);
+    const action: AgentAction = { type: normalizedType };
+
+    if (normalizedType === "write_file" || normalizedType === "append_file" || normalizedType === "patch_file") {
+      const pathValue = this.extractLikelyPathFromText(text);
+      if (pathValue) {
+        action.path = pathValue;
+      }
+    }
+
+    if (normalizedType === "write_file" || normalizedType === "append_file") {
+      const content = this.extractLikelyCodeContentFromText(text);
+      if (typeof content === "string" && content.length > 0) {
+        action.content = content;
+      }
+      if (normalizedType === "append_file") {
+        action.allowCreate = true;
+      }
+      if (typeof action.path !== "string" || typeof action.content !== "string") {
+        return undefined;
+      }
+      return {
+        reasoning: "Recovered from non-JSON model output.",
+        action
+      };
+    }
+
+    if (normalizedType === "run_command") {
+      const command = this.extractLikelyCommandFromText(text);
+      if (!command) {
+        return undefined;
+      }
+      action.command = command;
+      return {
+        reasoning: "Recovered run_command from non-JSON model output.",
+        action
+      };
+    }
+
+    if (normalizedType === "complete_step" || normalizedType === "final_answer") {
+      const summary = this.extractLikelySummaryFromText(text);
+      action.summary = summary;
+      return {
+        reasoning: "Recovered completion action from non-JSON model output.",
+        action
+      };
+    }
+
+    if (normalizedType === "read_file") {
+      const pathValue = this.extractLikelyPathFromText(text);
+      if (!pathValue) {
+        return undefined;
+      }
+      action.path = pathValue;
+      return {
+        reasoning: "Recovered read_file from non-JSON model output.",
+        action
+      };
+    }
+
+    if (normalizedType === "list_files") {
+      const pattern = this.extractLikelyListPattern(text) || "**/*";
+      action.pattern = pattern;
+      action.limit = 500;
+      return {
+        reasoning: "Recovered list_files from non-JSON model output.",
+        action
+      };
+    }
+
+    if (normalizedType === "search_code") {
+      const pattern = this.extractLikelySearchPattern(text);
+      if (!pattern) {
+        return undefined;
+      }
+      action.pattern = pattern;
+      action.limit = 200;
+      return {
+        reasoning: "Recovered search_code from non-JSON model output.",
+        action
+      };
+    }
+
+    return undefined;
+  }
+
+  private detectActionTypeFromText(text: string): string | undefined {
+    const lower = text.toLowerCase();
+    const directMatch = lower.match(
+      /\b(write_file|append_file|patch_file|read_file|list_files|search_code|run_command|ask_user|complete_step|final_answer)\b/
+    );
+    if (directMatch) {
+      return directMatch[1];
+    }
+    if (/\bwrite\b/.test(lower) && /\bfile\b/.test(lower)) {
+      return "write_file";
+    }
+    if (/\bcomplete\b|\bdone\b|\bfinish\b/.test(lower)) {
+      return "complete_step";
+    }
+    return undefined;
+  }
+
+  private extractLikelyPathFromText(text: string): string | undefined {
+    const quotedPath =
+      text.match(/(?:\"path\"|path|file\s*path)\s*[:=]\s*["'`]([^"'`\n]+)["'`]/i)?.[1] ??
+      text.match(/(?:\"path\"|path|file\s*path)\s*[:=]\s*([^\s,\n}]+)/i)?.[1];
+    if (quotedPath) {
+      return quotedPath.trim();
+    }
+
+    const pathLikeMatches = text.match(
+      /([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+\.[A-Za-z0-9]{1,12})/g
+    );
+    if (!pathLikeMatches || pathLikeMatches.length === 0) {
+      return undefined;
+    }
+    for (const candidate of pathLikeMatches) {
+      const lowered = candidate.toLowerCase();
+      if (lowered.startsWith("http://") || lowered.startsWith("https://")) {
+        continue;
+      }
+      if (lowered.includes("node_modules/")) {
+        continue;
+      }
+      return candidate.trim();
+    }
+    return undefined;
+  }
+
+  private extractLikelyCodeContentFromText(text: string): string | undefined {
+    const blocks = [...text.matchAll(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g)];
+    for (const block of blocks) {
+      const lang = (block[1] || "").trim().toLowerCase();
+      const body = (block[2] || "").replace(/\r\n/g, "\n");
+      if (!body.trim()) {
+        continue;
+      }
+      if (lang === "json" || lang === "javascript" || lang === "js") {
+        continue;
+      }
+      return body;
+    }
+
+    const contentMatch =
+      text.match(/\"content\"\s*:\s*\"([\s\S]*?)\"\s*(?:,|\n|})/i)?.[1] ??
+      text.match(/content\s*:\s*\"([\s\S]*?)\"\s*(?:,|\n|})/i)?.[1];
+    if (contentMatch && contentMatch.trim()) {
+      return contentMatch
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t");
+    }
+    return undefined;
+  }
+
+  private extractLikelyCommandFromText(text: string): string | undefined {
+    const fromField =
+      text.match(/(?:\"command\"|command)\s*[:=]\s*["'`]([^"'`\n]+)["'`]/i)?.[1] ??
+      text.match(/(?:\"command\"|command)\s*[:=]\s*([^\n}]+)/i)?.[1];
+    if (fromField && fromField.trim()) {
+      return fromField.trim();
+    }
+    const block = text.match(/```(?:bash|sh|zsh)?\n([\s\S]*?)```/i)?.[1];
+    if (block && block.trim()) {
+      return block.trim().split(/\r?\n/g)[0]?.trim();
+    }
+    return undefined;
+  }
+
+  private extractLikelySummaryFromText(text: string): string {
+    const summaryField =
+      text.match(/(?:\"summary\"|summary)\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] ??
+      text.match(/(?:\"reasoning\"|reasoning)\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1];
+    if (summaryField && summaryField.trim()) {
+      return truncate(summaryField.trim(), 240);
+    }
+    const firstSentence =
+      text
+        .replace(/\s+/g, " ")
+        .split(/[.!?]\s+/g)
+        .map((part) => part.trim())
+        .find((part) => part.length > 0) ?? "Step completed.";
+    return truncate(firstSentence, 240);
+  }
+
+  private extractLikelyListPattern(text: string): string | undefined {
+    const explicit = text.match(/(?:\"pattern\"|pattern)\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1];
+    if (explicit && explicit.trim()) {
+      return explicit.trim();
+    }
+    return undefined;
+  }
+
+  private extractLikelySearchPattern(text: string): string | undefined {
+    const explicit =
+      text.match(/(?:\"pattern\"|pattern|query)\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] ??
+      text.match(/(?:\"pattern\"|pattern|query)\s*[:=]\s*([^\n}]+)/i)?.[1];
+    if (explicit && explicit.trim()) {
+      return explicit.trim();
+    }
+    return undefined;
   }
 
   private extractActionFromDecision(decision: Record<string, unknown>): AgentAction | undefined {
