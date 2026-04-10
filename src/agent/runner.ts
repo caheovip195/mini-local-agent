@@ -59,18 +59,32 @@ const MAX_EXPLORATION_HARD_CAP_BUFFER = 4;
 const TEST_TASK_INVESTIGATION_HARD_CAP_BONUS = 4;
 const TURN_EXTENSION_CHUNK = 4;
 const MAX_TURN_EXTENSION_TOTAL = 18;
+const TURN_EXTENSION_RECENT_PROGRESS_WINDOW = 6;
+const MAX_TURNS_WITHOUT_PROGRESS_FOR_EXTENSION = 6;
+const HARD_STALL_BLOCKED_STREAK = 4;
+const HARD_STALL_SAME_FAILURE_STREAK = 3;
 const MAX_RESPONSIBILITY_BLOCKS_PER_STEP = 4;
 const MAX_BLOCKED_STREAK_BEFORE_RECOVERY = 5;
 const MAX_SAME_FAILURE_BEFORE_RECOVERY = 2;
 const MAX_WRITE_FILE_CONTENT_CHARS = 90000;
 const MAX_WRITE_FILE_HARD_CAP_CHARS = 220000;
 const FORCE_FULL_FILE_READ = true;
-const READ_FILE_RETURN_CHAR_LIMIT = 28000;
+const READ_FILE_RETURN_CHAR_LIMIT = 220000;
 const MAX_APPEND_FILE_CHUNK_CHARS = 2200;
 const MAX_PATCH_REPLACE_CHARS = 3200;
 const MAX_TRACKED_DIAGNOSTIC_ISSUES = 400;
 const MAX_TRACKED_DIAGNOSTIC_FILES = 12;
 const BATCH_DIAGNOSTIC_TRIGGER_COUNT = 6;
+const BATCH_DIAGNOSTIC_MIN_PRIMARY_SHARE = 0.45;
+const READ_CACHE_REPEAT_HINT_THRESHOLD = 1;
+const READ_CACHE_MAX_ENTRIES = 120;
+const RELATED_PRELOAD_FILE_LIMIT = 10;
+const RELATED_PRELOAD_FILE_CHAR_LIMIT = 7000;
+const READ_CACHE_PROMPT_CHAR_LIMIT = 6000;
+const READ_LEDGER_CONTEXT_PREFIX = "READ_LEDGER_CONTEXT:";
+const READ_LEDGER_CONTEXT_CHAR_LIMIT = 4200;
+const READ_LEDGER_MAX_ITEMS = 14;
+const READ_LEDGER_EXCERPT_ITEMS = 5;
 const ASK_USER_MIN_INVESTIGATIONS = 4;
 const WORKSPACE_INDEX_LIMIT = 4000;
 const SNAPSHOT_HEAD_PREVIEW = 220;
@@ -150,6 +164,30 @@ interface DiagnosticFileSummary {
   samples: string[];
 }
 
+interface BatchFixState {
+  path: string;
+  issueCount: number;
+  errors: number;
+  warnings: number;
+  infos: number;
+  commandKey: string;
+  diagnosticSignature: string;
+  requiresWrite: boolean;
+  activatedWriteRevision: number;
+}
+
+interface ReadCacheEntry {
+  path: string;
+  payload: string;
+  summary: string;
+  readCount: number;
+  lastStepId: string;
+  lastTurn: number;
+  fileWriteRevision: number;
+  isTruncated: boolean;
+  sourceCharLength: number;
+}
+
 const PLANNER_SNAPSHOT_OPTIONS: WorkspaceSnapshotOptions = {
   fileLimit: 2500,
   keyFiles: [
@@ -212,6 +250,11 @@ export class LocalAgentRunner {
   private failedVerificationCommandKey = "";
   private failedVerificationWriteRevision = -1;
   private failedVerificationDiagnosticSignature = "";
+  private batchFixState?: BatchFixState;
+  private readonly readCacheByPath = new Map<string, ReadCacheEntry>();
+  private readonly fileWriteRevisionByPath = new Map<string, number>();
+  private activeStepId = "";
+  private activeTurn = 0;
   private currentTaskScope?: TaskScopeProfile;
   private totalInvestigationActions = 0;
 
@@ -226,6 +269,7 @@ export class LocalAgentRunner {
     this.currentTaskScope = scopeProfile;
     await this.refreshProjectTechProfile();
     await this.enrichTaskScopeWithWorkspace(scopeProfile);
+    await this.preloadRelatedReadCache(task, scopeProfile);
     this.callbacks.onLog(
       `Task scope: class=${scopeProfile.scopeClass}, testTask=${scopeProfile.isTestTask}, allowRewrite=${scopeProfile.allowRewrite}, maxChangedFiles=${scopeProfile.maxChangedFiles}, focus=${scopeProfile.focusTerms.join(", ") || "(none)"}`
     );
@@ -243,7 +287,7 @@ export class LocalAgentRunner {
     const messages: ChatMessage[] = [
       {
         role: "system",
-        content: buildPlannerSystemPrompt(this.config.extraSystemPrompt)
+        content: buildPlannerSystemPrompt(this.config.extraSystemPrompt, this.config.systemPromptMode)
       },
       {
         role: "user",
@@ -273,6 +317,10 @@ export class LocalAgentRunner {
           "Selected implementation strategy:",
           this.selectedStrategyBrief,
           "",
+          "Preloaded related file cache:",
+          this.buildReadCachePromptContext(),
+          "Cache policy: prioritize cached related context and avoid requesting read_file for the same path again unless refresh is truly needed.",
+          "",
           "Workspace context:",
           workspaceContext,
           "",
@@ -284,6 +332,7 @@ export class LocalAgentRunner {
     const plannerResponse = await this.client.chat(messages, signal, {
       temperature: 0.1,
       maxTokens: 1400,
+      thinkingEnabled: this.config.thinkingEnabled,
       thinkingEffort: this.getThinkingEffortOption(),
       responseFormat: "json_object"
     });
@@ -318,6 +367,11 @@ export class LocalAgentRunner {
     this.failedVerificationCommandKey = "";
     this.failedVerificationWriteRevision = -1;
     this.failedVerificationDiagnosticSignature = "";
+    this.batchFixState = undefined;
+    this.readCacheByPath.clear();
+    this.fileWriteRevisionByPath.clear();
+    this.activeStepId = "";
+    this.activeTurn = 0;
     this.totalInvestigationActions = 0;
     this.knownPaths.clear();
     this.readSummaryByPath.clear();
@@ -420,7 +474,7 @@ export class LocalAgentRunner {
     const stepMessages: ChatMessage[] = [
       {
         role: "system",
-        content: buildExecutorSystemPrompt(this.config.extraSystemPrompt)
+        content: buildExecutorSystemPrompt(this.config.extraSystemPrompt, this.config.systemPromptMode)
       },
       {
         role: "user",
@@ -455,6 +509,9 @@ export class LocalAgentRunner {
           `Preferred response language: ${this.getPreferredResponseLanguage()}`,
           "Persistent evidence from previous steps:",
           persistentMemory,
+          "Cached related file context:",
+          this.buildReadCachePromptContext(),
+          "Cache policy: do not request repeated read_file for paths already in cache; continue execution using cached memory unless refresh=true is explicitly necessary.",
           "Workspace context:",
           workspaceContext,
           "Return JSON action now."
@@ -483,27 +540,36 @@ export class LocalAgentRunner {
     let lastInvestigationProgressTurn = 0;
     let investigationProgressCount = 0;
     let extensionCount = 0;
+    let successfulReadCount = 0;
+    let focusedReadCount = 0;
+    let writeActionCount = 0;
 
     for (let turn = 1; turn <= stepTurnLimit; turn += 1) {
       if (signal?.aborted) {
         throw new Error("Run cancelled.");
       }
+      this.activeStepId = step.id;
+      this.activeTurn = turn;
 
       if (turn === stepTurnLimit && stepTurnLimit < stepTurnHardLimit) {
         const changedInThisStep = this.changedFiles.size > changedFilesAtStepStart;
         const recentExecutionProgress =
-          lastExecutionProgressTurn > 0 && turn - lastExecutionProgressTurn <= 3;
+          lastExecutionProgressTurn > 0 && turn - lastExecutionProgressTurn <= TURN_EXTENSION_RECENT_PROGRESS_WINDOW;
         const recentInvestigationProgress =
-          lastInvestigationProgressTurn > 0 && turn - lastInvestigationProgressTurn <= 3;
+          lastInvestigationProgressTurn > 0 &&
+          turn - lastInvestigationProgressTurn <= TURN_EXTENSION_RECENT_PROGRESS_WINDOW;
+        const hasProgressSignals =
+          recentExecutionProgress ||
+          recentInvestigationProgress ||
+          changedInThisStep ||
+          executionProgressCount >= 1 ||
+          investigationProgressCount >= minInvestigations;
+        const hardStall =
+          turnsWithoutProgress >= MAX_TURNS_WITHOUT_PROGRESS_FOR_EXTENSION &&
+          blockedActionStreak >= HARD_STALL_BLOCKED_STREAK &&
+          repeatedFailureCount >= HARD_STALL_SAME_FAILURE_STREAK;
         const shouldExtend =
-          turnsWithoutProgress <= 2 &&
-          (
-            recentExecutionProgress ||
-            recentInvestigationProgress ||
-            changedInThisStep ||
-            executionProgressCount >= 2 ||
-            investigationProgressCount >= minInvestigations + 1
-          );
+          hasProgressSignals && !hardStall && turnsWithoutProgress <= MAX_TURNS_WITHOUT_PROGRESS_FOR_EXTENSION;
 
         if (shouldExtend) {
           const extension = Math.min(TURN_EXTENSION_CHUNK, stepTurnHardLimit - stepTurnLimit);
@@ -514,10 +580,15 @@ export class LocalAgentRunner {
               `TurnBudgetGuard: extending ${step.id} by ${extension} turn(s) (new limit ${stepTurnLimit}/${stepTurnHardLimit}) due to ongoing execution progress.`
             );
           }
+        } else if (hasProgressSignals) {
+          this.callbacks.onLog(
+            `TurnBudgetGuard: no extension for ${step.id} (signals=${hasProgressSignals}, noProgress=${turnsWithoutProgress}, blocked=${blockedActionStreak}, sameFailure=${repeatedFailureCount}).`
+          );
         }
       }
 
       this.compactStepMessages(stepMessages);
+      this.upsertReadLedgerContextMessage(stepMessages, step);
       this.callbacks.onStatus(
         this.t(`Step ${step.id} turn ${turn}/${stepTurnLimit}`, `Bước ${step.id} lượt ${turn}/${stepTurnLimit}`)
       );
@@ -551,6 +622,7 @@ export class LocalAgentRunner {
           temperature: 0.1,
           maxTokens: Math.min(8000, this.getExecutorMaxTokens() + maxTokensBoost),
           stream: true,
+          thinkingEnabled: this.config.thinkingEnabled,
           thinkingEffort: this.getThinkingEffortOption(),
           responseFormat: "json_object",
           onDelta: (delta) => {
@@ -753,7 +825,7 @@ export class LocalAgentRunner {
         forceExecutionOnly = true;
       }
 
-      if (forceExecutionOnly && this.isInvestigationAction(actionType)) {
+      if (!this.isRelaxedGuardMode() && forceExecutionOnly && this.isInvestigationAction(actionType)) {
         explorationGuardBlocks += 1;
         const guardMessage = [
           "ExecutionOnlyGuard: exploration loop detected for this step.",
@@ -796,7 +868,12 @@ export class LocalAgentRunner {
       const budgetReached = investigationCount >= maxInvestigations;
       const progressStalled =
         turnsWithoutProgress >= NO_PROGRESS_WARNING_THRESHOLD && !isNewInvestigationAction;
-      if (this.isInvestigationAction(actionType) && budgetReached && (isRepeatedInvestigation || progressStalled)) {
+      if (
+        !this.isRelaxedGuardMode() &&
+        this.isInvestigationAction(actionType) &&
+        budgetReached &&
+        (isRepeatedInvestigation || progressStalled)
+      ) {
         forceExecutionOnly = true;
         explorationGuardBlocks += 1;
         const guardMessage = [
@@ -837,6 +914,12 @@ export class LocalAgentRunner {
       }
 
       if (this.requiresInvestigation(actionType) && investigationCount < minInvestigations) {
+        const hasCachedEvidence = this.hasRelevantReadEvidenceForStep(step);
+        if (hasCachedEvidence) {
+          this.callbacks.onLog(
+            `InvestigationGuard bypass: sufficient cached read evidence exists for ${step.id}.`
+          );
+        } else {
         const guardMessage = this.buildInvestigationGuardMessage(
           actionType,
           investigationCount,
@@ -853,6 +936,51 @@ export class LocalAgentRunner {
         stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
         turnsWithoutProgress += 1;
         continue;
+        }
+      }
+
+      const isWriteAction = ["write_file", "append_file", "patch_file"].includes(actionType);
+      if (!this.isRelaxedGuardMode() && isWriteAction && writeActionCount === 0) {
+        const hasReadEvidence =
+          successfulReadCount > 0 || focusedReadCount > 0 || this.hasRelevantReadEvidenceForStep(step);
+        if (!hasReadEvidence) {
+          const guardMessage = this.t(
+            "BaseReadGuard: before first code write in this step, read relevant existing project code (controller/page/service/test pattern) to match architecture and style.",
+            "BaseReadGuard: trước khi ghi code lần đầu ở bước này, phải đọc code hiện có liên quan trong project (controller/page/service/pattern test) để bám kiến trúc và style."
+          );
+          this.callbacks.onLog(guardMessage);
+          this.callbacks.onAction?.({
+            stepId: step.id,
+            turn,
+            actionType,
+            status: "blocked",
+            detail: guardMessage
+          });
+          stepMessages.push({ role: "user", content: `TOOL_RESULT:\n${guardMessage}` });
+
+          const readRecoveryAction = await this.buildMandatoryReadAction(step);
+          const recovery = await this.executeRecoveryAction(
+            readRecoveryAction,
+            investigationCount,
+            stepMessages,
+            "BaseReadRecovery",
+            step.id,
+            turn
+          );
+          investigationCount = recovery.investigationCount;
+          turnsWithoutProgress = recovery.progress ? 0 : turnsWithoutProgress + 1;
+          if (recovery.progress && recovery.executedActionType === "read_file") {
+            successfulReadCount += 1;
+            const recoveredPath = this.normalizeRelativePath(recovery.executedActionPath ?? "");
+            if (recoveredPath && this.isPathRelevantForStep(recoveredPath, step)) {
+              focusedReadCount += 1;
+            }
+          }
+          if (recovery.finalResult) {
+            return recovery.finalResult;
+          }
+          continue;
+        }
       }
 
       if (this.shouldRunResponsibilityReview(actionType)) {
@@ -1041,6 +1169,16 @@ export class LocalAgentRunner {
       const effectiveProgress =
         actionResult.progress || (this.isInvestigationAction(actionType) && isNewInvestigationAction);
       turnsWithoutProgress = effectiveProgress ? 0 : turnsWithoutProgress + 1;
+      if (actionType === "read_file" && actionResult.progress) {
+        successfulReadCount += 1;
+        const readPath = this.normalizeRelativePath(toStringValue(decision.action.path).trim());
+        if (readPath && this.isPathRelevantForStep(readPath, step)) {
+          focusedReadCount += 1;
+        }
+      }
+      if (isWriteAction && actionResult.progress) {
+        writeActionCount += 1;
+      }
       if (effectiveProgress && this.isInvestigationAction(actionType) && isNewInvestigationAction) {
         lastInvestigationProgressTurn = turn;
         investigationProgressCount += 1;
@@ -1060,10 +1198,30 @@ export class LocalAgentRunner {
       });
     }
 
+    const changedInThisStep = this.changedFiles.size > changedFilesAtStepStart;
+    const hasExecutionProgress = executionProgressCount > 0 || changedInThisStep;
+    const verificationSatisfied =
+      !changedInThisStep ||
+      (!this.pendingValidationAfterWrite && this.verificationStatus === "passed");
+    if (hasExecutionProgress && verificationSatisfied) {
+      const autoSummary = this.t(
+        `Step ${step.id} reached turn budget and was auto-completed from verified progress.`,
+        `Bước ${step.id} đạt giới hạn lượt và đã tự hoàn tất dựa trên tiến độ đã xác minh.`
+      );
+      this.callbacks.onLog(
+        `TurnBudgetGuard: auto-completing ${step.id} (turnLimit=${stepTurnLimit}, extensions=${extensionCount}, executionProgress=${executionProgressCount}, changedInStep=${changedInThisStep}, verification=${this.verificationStatus}).`
+      );
+      return {
+        done: true,
+        summary: autoSummary,
+        changedFiles: Array.from(this.changedFiles.values())
+      };
+    }
+
     throw new Error(
       this.t(
-        `Step ${step.id} exceeded max turns (${stepTurnLimit}${extensionCount > 0 ? `, extended ${extensionCount} time(s)` : ""}). Agent may be looping.`,
-        `Bước ${step.id} đã vượt giới hạn lượt (${stepTurnLimit}${extensionCount > 0 ? `, đã gia hạn ${extensionCount} lần` : ""}). Có thể đang lặp.`
+        `Step ${step.id} exceeded max turns (${stepTurnLimit}${extensionCount > 0 ? `, extended ${extensionCount} time(s)` : ""}). Stalled counters: noProgress=${turnsWithoutProgress}, blocked=${blockedActionStreak}, sameFailure=${repeatedFailureCount}.`,
+        `Bước ${step.id} đã vượt giới hạn lượt (${stepTurnLimit}${extensionCount > 0 ? `, đã gia hạn ${extensionCount} lần` : ""}). Chỉ số kẹt: noProgress=${turnsWithoutProgress}, blocked=${blockedActionStreak}, sameFailure=${repeatedFailureCount}.`
       )
     );
   }
@@ -1075,7 +1233,13 @@ export class LocalAgentRunner {
     reason: string,
     stepId: string,
     turn: number
-  ): Promise<{ investigationCount: number; progress: boolean; finalResult?: StepResult }> {
+  ): Promise<{
+    investigationCount: number;
+    progress: boolean;
+    executedActionType: string;
+    executedActionPath?: string;
+    finalResult?: StepResult;
+  }> {
     const actionType = this.normalizeActionType(toStringValue(action.type));
     action.type = actionType;
     let nextInvestigationCount = investigationCount;
@@ -1098,6 +1262,8 @@ export class LocalAgentRunner {
       return {
         investigationCount: nextInvestigationCount,
         progress: true,
+        executedActionType: actionType,
+        executedActionPath: toStringValue(action.path).trim() || undefined,
         finalResult: {
           done: true,
           summary: result.message,
@@ -1113,7 +1279,9 @@ export class LocalAgentRunner {
 
     return {
       investigationCount: nextInvestigationCount,
-      progress: result.progress
+      progress: result.progress,
+      executedActionType: actionType,
+      executedActionPath: toStringValue(action.path).trim() || undefined
     };
   }
 
@@ -1122,6 +1290,22 @@ export class LocalAgentRunner {
     investigationCount: number
   ): Promise<ActionExecutionResult> {
     const type = this.normalizeActionType(toStringValue(action.type).trim());
+    const batchFixGuard = this.evaluateBatchFixGuard(type, action);
+    if (batchFixGuard) {
+      return {
+        kind: "tool",
+        message: batchFixGuard,
+        progress: false
+      };
+    }
+    const postWriteQualityGate = await this.evaluatePostWriteVerificationGate(type, action);
+    if (postWriteQualityGate) {
+      return {
+        kind: "tool",
+        message: postWriteQualityGate,
+        progress: false
+      };
+    }
 
     switch (type) {
       case "list_files": {
@@ -1171,6 +1355,7 @@ export class LocalAgentRunner {
           const endLineRaw = toNumberValue(action.endLine, Number.MAX_SAFE_INTEGER);
           const absPath = this.resolveWorkspacePath(filePath);
           const relPath = this.toRelative(absPath);
+          const normalizedRelPath = this.normalizeRelativePath(relPath);
           const pathGuard = this.evaluatePathAccessGuard(relPath, "read");
           if (pathGuard) {
             return {
@@ -1187,6 +1372,51 @@ export class LocalAgentRunner {
               progress: false
             };
           }
+          const refreshRequested = this.isActionRefreshRequested(action);
+          const fileWriteRevision = this.fileWriteRevisionByPath.get(normalizedRelPath) ?? 0;
+          const cached = this.readCacheByPath.get(normalizedRelPath);
+          if (
+            !refreshRequested &&
+            cached &&
+            cached.fileWriteRevision === fileWriteRevision &&
+            cached.payload.length > 0
+          ) {
+            const nextReadCount = cached.readCount + 1;
+            const updatedCache: ReadCacheEntry = {
+              ...cached,
+              readCount: nextReadCount,
+              lastStepId: this.activeStepId,
+              lastTurn: this.activeTurn
+            };
+            this.readCacheByPath.set(normalizedRelPath, updatedCache);
+            const recall = this.formatReadCacheRecall(updatedCache);
+            const cacheHint =
+              nextReadCount > READ_CACHE_REPEAT_HINT_THRESHOLD
+                ? this.t(
+                    `ReadCache replay: '${normalizedRelPath}' has been requested ${nextReadCount} times in this request. Use this cached memory and continue with write/run action instead of requesting this read again.`,
+                    `ReadCache replay: '${normalizedRelPath}' đã được yêu cầu ${nextReadCount} lần trong request này. Hãy dùng dữ liệu cache này và chuyển sang write/run thay vì yêu cầu đọc lại file này.`
+                  )
+                : this.t(
+                    "ReadCache hit: using cached file content from current request.",
+                    "ReadCache hit: dùng nội dung file đã cache trong request hiện tại."
+                  );
+            const truncationHint = updatedCache.isTruncated
+              ? this.t(
+                  `ReadCache note: payload for '${normalizedRelPath}' was truncated (${updatedCache.sourceCharLength} chars > ${READ_FILE_RETURN_CHAR_LIMIT}).`,
+                  `ReadCache note: payload của '${normalizedRelPath}' đã bị cắt (${updatedCache.sourceCharLength} ký tự > ${READ_FILE_RETURN_CHAR_LIMIT}).`
+                )
+              : "";
+            const notes = [cacheHint, truncationHint, recall].filter(Boolean).join("\n");
+            const noteBudget = Math.max(0, READ_FILE_RETURN_CHAR_LIMIT - updatedCache.payload.length - 2);
+            const notePrefix =
+              noteBudget > 120 && notes.length > 0 ? `${truncate(notes, noteBudget)}\n` : "";
+            const cachedMessage = `${notePrefix}${updatedCache.payload}`;
+            return {
+              kind: "tool",
+              message: cachedMessage,
+              progress: true
+            };
+          }
           const content = await fs.readFile(absPath, "utf8");
           const lines = content.split(/\r?\n/g);
           let startLine = Math.max(1, Math.floor(startLineRaw));
@@ -1196,13 +1426,41 @@ export class LocalAgentRunner {
             endLine = Math.max(1, lines.length);
           }
           const chunk = lines.slice(startLine - 1, endLine).join("\n");
+          const readPayload = this.buildReadFilePayload(
+            relPath,
+            startLine,
+            endLine,
+            FORCE_FULL_FILE_READ ? "full_file" : "range",
+            chunk
+          );
+          const payload = readPayload.payload;
+          const summary = this.buildReadSummaryFromToolMessage(payload);
+          this.readCacheByPath.set(normalizedRelPath, {
+            path: normalizedRelPath,
+            payload,
+            summary,
+            readCount: 1,
+            lastStepId: this.activeStepId,
+            lastTurn: this.activeTurn,
+            fileWriteRevision,
+            isTruncated: readPayload.isTruncated,
+            sourceCharLength: readPayload.sourceCharLength
+          });
+          this.trimReadCache();
 
+          const truncationNote = readPayload.isTruncated
+            ? this.t(
+                `\nREAD_TRUNCATED: true (${readPayload.sourceCharLength} chars > ${READ_FILE_RETURN_CHAR_LIMIT}).`,
+                `\nREAD_TRUNCATED: true (${readPayload.sourceCharLength} ký tự > ${READ_FILE_RETURN_CHAR_LIMIT}).`
+              )
+            : "";
+          const truncationTail =
+            truncationNote.length > 0 && readPayload.payload.length + truncationNote.length < READ_FILE_RETURN_CHAR_LIMIT
+              ? truncationNote
+              : "";
           return {
             kind: "tool",
-            message: truncate(
-              `FILE ${relPath} [${startLine}-${endLine}]\nREAD_MODE: ${FORCE_FULL_FILE_READ ? "full_file" : "range"}\n${chunk}`,
-              READ_FILE_RETURN_CHAR_LIMIT
-            ),
+            message: `${payload}${truncationTail}`,
             progress: true
           };
         } catch (error) {
@@ -1431,9 +1689,11 @@ export class LocalAgentRunner {
           const renderedWithDiagnostics = diagnosticNote
             ? `${rendered}\n\n${diagnosticNote}`
             : rendered;
-          const hasErrorDiagnostics = this.latestDiagnosticFiles.some((item) => item.errors > 0);
+          const blockingDiagnostics = this.getBlockingDiagnosticsForChangedFiles();
+          const hasBlockingDiagnostics = blockingDiagnostics.length > 0;
           if (isVerificationCommand) {
-            if (hasErrorDiagnostics) {
+            if (hasBlockingDiagnostics) {
+              const blockingSummary = this.formatBlockingDiagnosticsSummary(blockingDiagnostics);
               this.verificationStatus = "failed";
               this.pendingValidationAfterWrite = true;
               this.lastVerificationLog = truncate(renderedWithDiagnostics, 2400);
@@ -1443,7 +1703,7 @@ export class LocalAgentRunner {
               return {
                 kind: "tool",
                 message: truncate(
-                  `${renderedWithDiagnostics}\n\nVerificationGuard: command exited but still contains syntax/compile errors. Fix diagnostics and rerun.`
+                  `${renderedWithDiagnostics}\n\nVerificationGuard: unresolved diagnostics remain in changed files${blockingSummary ? ` (${blockingSummary})` : ""}. Fix and rerun.`
                 ),
                 progress: false
               };
@@ -1533,6 +1793,18 @@ export class LocalAgentRunner {
 
       case "complete_step": {
         const summary = toStringValue(action.summary, "Step completed.");
+        const unresolvedDiagnostics = this.getBlockingDiagnosticsForChangedFiles();
+        if (unresolvedDiagnostics.length > 0) {
+          const suggested = await this.suggestVerificationCommand();
+          const detail = this.formatBlockingDiagnosticsSummary(unresolvedDiagnostics);
+          return {
+            kind: "tool",
+            message: suggested
+              ? `QualityGuard: unresolved diagnostics in changed files (${detail}). Fix then run: ${suggested}`
+              : `QualityGuard: unresolved diagnostics in changed files (${detail}). Fix and rerun relevant verification command.`,
+            progress: false
+          };
+        }
         if (this.changedFiles.size > 0 && (this.pendingValidationAfterWrite || this.verificationStatus !== "passed")) {
           const suggested = await this.suggestVerificationCommand();
           const reason =
@@ -1556,6 +1828,18 @@ export class LocalAgentRunner {
           if (testQualityIssue) {
             return { kind: "tool", message: testQualityIssue, progress: false };
           }
+        }
+        const unresolvedDiagnostics = this.getBlockingDiagnosticsForChangedFiles();
+        if (unresolvedDiagnostics.length > 0) {
+          const suggested = await this.suggestVerificationCommand();
+          const detail = this.formatBlockingDiagnosticsSummary(unresolvedDiagnostics);
+          return {
+            kind: "tool",
+            message: suggested
+              ? `QualityGuard: unresolved diagnostics in changed files (${detail}). Fix then run: ${suggested}`
+              : `QualityGuard: unresolved diagnostics in changed files (${detail}). Fix and rerun verification command first.`,
+            progress: false
+          };
         }
         if (this.changedFiles.size > 0 && (this.pendingValidationAfterWrite || this.verificationStatus !== "passed")) {
           const suggested = await this.suggestVerificationCommand();
@@ -1590,6 +1874,18 @@ export class LocalAgentRunner {
     const maxInvestigations = Math.max(minInvestigations + MAX_EXTRA_INVESTIGATION_ACTIONS, minInvestigations * 2);
     if (this.changedFiles.size > 0 && this.pendingValidationAfterWrite) {
       if (this.verificationStatus === "failed") {
+        const canUseBatchDiagnostics =
+          this.latestDiagnosticCommandKey.length > 0 &&
+          this.latestDiagnosticCommandKey === this.normalizeCommandKey(this.lastVerificationCommand);
+        const dominantDiagnostic = canUseBatchDiagnostics
+          ? this.getDominantDiagnosticFile(BATCH_DIAGNOSTIC_TRIGGER_COUNT)
+          : undefined;
+        if (dominantDiagnostic) {
+          return {
+            type: "read_file",
+            path: dominantDiagnostic.path
+          };
+        }
         const location = this.extractErrorLocationFromLog(this.lastVerificationLog);
         if (location) {
           return {
@@ -1641,29 +1937,36 @@ export class LocalAgentRunner {
     }
 
     if (investigationCount <= 0) {
+      const focusedPattern = this.buildFilePatternFromStep(step);
       if (scope?.isTestTask) {
         return {
           type: "list_files",
-          pattern: await this.pickTestListPatternFromScope(),
+          pattern: focusedPattern !== "**/*" ? focusedPattern : await this.pickTestListPatternFromScope(),
           limit: 500
         };
       }
       return {
         type: "list_files",
-        pattern: "**/*",
+        pattern: focusedPattern,
         limit: 500
       };
     }
 
     if (investigationCount <= 1) {
+      const preferredRead = await this.findPreferredReadFileForStep(step);
+      if (preferredRead) {
+        return {
+          type: "read_file",
+          path: preferredRead
+        };
+      }
+
       if (scope?.isTestTask) {
         const focusedTestFile = await this.findFirstTestFileForScope();
         if (focusedTestFile) {
           return {
             type: "read_file",
             path: focusedTestFile,
-            startLine: 1,
-            endLine: 260
           };
         }
       }
@@ -1682,9 +1985,7 @@ export class LocalAgentRunner {
       if (bootstrapFile) {
         return {
           type: "read_file",
-          path: bootstrapFile,
-          startLine: 1,
-          endLine: 220
+          path: bootstrapFile
         };
       }
     }
@@ -1747,6 +2048,22 @@ export class LocalAgentRunner {
 
     if (latest.actionType === "run_command") {
       if (this.looksLikeSyntaxOrCompileFailure(latest.message)) {
+        const canUseBatchDiagnostics =
+          this.latestDiagnosticCommandKey.length > 0 &&
+          this.latestDiagnosticCommandKey === this.normalizeCommandKey(latest.target);
+        const dominantDiagnostic = canUseBatchDiagnostics
+          ? this.getDominantDiagnosticFile(BATCH_DIAGNOSTIC_TRIGGER_COUNT)
+          : undefined;
+        if (dominantDiagnostic) {
+          alternatives.push(`read_file ${dominantDiagnostic.path} (batch diagnostics)`);
+          return pick(
+            {
+              type: "read_file",
+              path: dominantDiagnostic.path
+            },
+            "Many diagnostics found in one file; read full file and fix all issues in one pass."
+          );
+        }
         const location = this.extractErrorLocationFromLog(latest.message);
         if (location) {
           alternatives.push(`read_file ${location.path}:${location.startLine}-${location.endLine}`);
@@ -1959,6 +2276,16 @@ export class LocalAgentRunner {
   private extractErrorLocationFromLog(
     log: string
   ): { path: string; startLine: number; endLine: number } | undefined {
+    const topDiagnostic = this.latestDiagnosticIssues[0];
+    if (topDiagnostic) {
+      const center = Math.max(1, topDiagnostic.line);
+      return {
+        path: topDiagnostic.path,
+        startLine: Math.max(1, center - 80),
+        endLine: center + 160
+      };
+    }
+
     if (!log.trim()) {
       return undefined;
     }
@@ -2087,6 +2414,44 @@ export class LocalAgentRunner {
     return preferred ?? testFiles[0];
   }
 
+  private async findPreferredReadFileForStep(step: PlanStep): Promise<string | undefined> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    const scopeTerms = this.currentTaskScope?.focusTerms ?? [];
+    const stepTerms = this.extractStepKeywords(step, 8);
+    const terms = Array.from(new Set([...scopeTerms, ...stepTerms])).filter((item) => item.length >= 3);
+
+    const scored: Array<{ path: string; score: number }> = [];
+    for (const file of files) {
+      const lower = file.toLowerCase();
+      if (this.isFrameworkOrGeneratedPath(lower)) {
+        continue;
+      }
+      let score = 0;
+      if (terms.length > 0 && this.pathMatchesFocusTerms(file, terms)) {
+        score += 80;
+      }
+      if (this.currentTaskScope?.isTestTask && this.isLikelyTestFile(lower)) {
+        score += 16;
+      }
+      const cacheEntry = this.readCacheByPath.get(this.normalizeRelativePath(file));
+      if (!cacheEntry) {
+        score += 24;
+      } else {
+        score -= Math.min(20, cacheEntry.readCount * 5);
+      }
+      score += Math.max(0, 16 - this.getPathPriorityRank(file) * 2);
+      if (score > 0) {
+        scored.push({ path: file, score });
+      }
+    }
+
+    if (scored.length === 0) {
+      return undefined;
+    }
+    scored.sort((a, b) => b.score - a.score || this.comparePathPriority(a.path, b.path));
+    return scored[0]?.path;
+  }
+
   private extractStepKeywords(step: PlanStep, max = 4): string[] {
     const raw = `${step.title} ${step.details}`.toLowerCase();
     const tokens = raw.match(/[a-z_][a-z0-9_]{2,}/g) ?? [];
@@ -2203,6 +2568,7 @@ export class LocalAgentRunner {
       {
         temperature: 0.12,
         maxTokens: 1400,
+        thinkingEnabled: this.config.thinkingEnabled,
         thinkingEffort: this.getThinkingEffortOption(),
         responseFormat: "json_object"
       }
@@ -2325,7 +2691,7 @@ export class LocalAgentRunner {
       };
     }
 
-    if (this.isLikelyCodebaseLocationQuestion(question)) {
+    if (!this.isRelaxedGuardMode() && this.isLikelyCodebaseLocationQuestion(question)) {
       return {
         blocked: true,
         message: [
@@ -2336,7 +2702,9 @@ export class LocalAgentRunner {
       };
     }
 
-    const askMinInvestigations = Math.max(this.config.minInvestigationsBeforeExecute + 2, ASK_USER_MIN_INVESTIGATIONS);
+    const askMinInvestigations = this.isRelaxedGuardMode()
+      ? Math.max(1, this.config.minInvestigationsBeforeExecute)
+      : Math.max(this.config.minInvestigationsBeforeExecute + 2, ASK_USER_MIN_INVESTIGATIONS);
     if (investigationCount < askMinInvestigations) {
       const remaining = askMinInvestigations - investigationCount;
       return {
@@ -2374,6 +2742,9 @@ export class LocalAgentRunner {
   }
 
   private computeRequiredInvestigationsForStep(): number {
+    if (this.isRelaxedGuardMode()) {
+      return 1;
+    }
     const base = Math.max(1, this.config.minInvestigationsBeforeExecute);
     const scope = this.currentTaskScope;
     const complexityBonus = scope ? Math.min(2, Math.max(0, scope.requirementComplexity - 2)) : 0;
@@ -2403,6 +2774,9 @@ export class LocalAgentRunner {
   }
 
   private shouldRunResponsibilityReview(type: string): boolean {
+    if (this.isRelaxedGuardMode()) {
+      return false;
+    }
     if (!this.config.strictResponsibilityMode) {
       return false;
     }
@@ -2485,6 +2859,7 @@ export class LocalAgentRunner {
         {
           temperature: 0.05,
           maxTokens: 220,
+          thinkingEnabled: this.config.thinkingEnabled,
           thinkingEffort: this.getThinkingEffortOption(),
           responseFormat: "json_object"
         }
@@ -2593,6 +2968,83 @@ export class LocalAgentRunner {
     return false;
   }
 
+  private hasRelevantReadEvidenceForStep(step: PlanStep): boolean {
+    if (this.readSummaryByPath.size === 0) {
+      return false;
+    }
+    for (const readPath of this.readSummaryByPath.keys()) {
+      if (this.isPathRelevantForStep(readPath, step)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private isPathRelevantForStep(pathLike: string, step: PlanStep): boolean {
+    const normalizedPath = this.normalizeRelativePath(pathLike);
+    if (!normalizedPath) {
+      return false;
+    }
+    const scopeTerms = this.currentTaskScope?.focusTerms ?? [];
+    const stepTerms = this.extractStepKeywords(step, 6);
+    const terms = Array.from(new Set([...scopeTerms, ...stepTerms])).filter((item) => item.length >= 3);
+    if (terms.length === 0) {
+      return true;
+    }
+    return this.pathMatchesFocusTerms(normalizedPath, terms);
+  }
+
+  private async buildMandatoryReadAction(step: PlanStep): Promise<AgentAction> {
+    const scope = this.currentTaskScope;
+    if (scope?.isTestTask) {
+      const focusedTestFile = await this.findFirstTestFileForScope();
+      if (focusedTestFile) {
+        return {
+          type: "read_file",
+          path: focusedTestFile
+        };
+      }
+    }
+
+    const knownCandidates = Array.from(this.knownPaths.values())
+      .map((item) => this.normalizeRelativePath(item))
+      .filter((item) => !!item && this.isPathRelevantForStep(item, step))
+      .slice(0, 24);
+    for (const candidate of knownCandidates) {
+      if (!candidate) {
+        continue;
+      }
+      if (this.isFrameworkOrGeneratedPath(candidate.toLowerCase())) {
+        continue;
+      }
+      return {
+        type: "read_file",
+        path: candidate
+      };
+    }
+
+    const fallback = await this.findFirstExistingFile([
+      "lib/main.dart",
+      "src/extension.ts",
+      "src/index.ts",
+      "README.md",
+      "package.json",
+      "pubspec.yaml"
+    ]);
+    if (fallback) {
+      return {
+        type: "read_file",
+        path: fallback
+      };
+    }
+
+    return {
+      type: "list_files",
+      pattern: this.currentTaskScope?.isTestTask ? "test/**/*" : "**/*",
+      limit: 300
+    };
+  }
+
   private estimateActionPayloadChars(action: AgentAction): number {
     let total = 0;
     for (const [key, value] of Object.entries(action)) {
@@ -2673,6 +3125,82 @@ export class LocalAgentRunner {
     messages.splice(0, messages.length, ...fixedPrefix, ...tail);
   }
 
+  private upsertReadLedgerContextMessage(messages: ChatMessage[], step: PlanStep): void {
+    const ledgerContent = `${READ_LEDGER_CONTEXT_PREFIX}\n${this.buildReadLedgerContext(step)}`;
+    for (let index = messages.length - 1; index >= 2; index -= 1) {
+      const item = messages[index];
+      if (item?.role === "user" && item.content.startsWith(READ_LEDGER_CONTEXT_PREFIX)) {
+        messages.splice(index, 1);
+      }
+    }
+    messages.splice(2, 0, {
+      role: "user",
+      content: ledgerContent
+    });
+  }
+
+  private buildReadLedgerContext(step: PlanStep): string {
+    const scopeTerms = this.currentTaskScope?.focusTerms ?? [];
+    const stepTerms = this.extractStepKeywords(step, 6);
+    const terms = Array.from(new Set([...scopeTerms, ...stepTerms])).filter((item) => item.length >= 3);
+    const entries = Array.from(this.readCacheByPath.values())
+      .filter((item) => !this.isFrameworkOrGeneratedPath(item.path))
+      .map((item) => {
+        let score = 0;
+        if (scopeTerms.length > 0 && this.pathMatchesFocusTerms(item.path, scopeTerms)) {
+          score += 90;
+        }
+        if (terms.length > 0 && this.pathMatchesFocusTerms(item.path, terms)) {
+          score += 70;
+        }
+        if (this.currentTaskScope?.isTestTask && this.isLikelyTestFile(item.path.toLowerCase())) {
+          score += 16;
+        }
+        if (item.lastStepId === step.id) {
+          score += 12;
+        }
+        score += Math.min(20, item.readCount * 4);
+        score += Math.max(0, 12 - this.getPathPriorityRank(item.path) * 2);
+        return { item, score };
+      })
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.item.readCount - left.item.readCount ||
+          right.item.lastTurn - left.item.lastTurn ||
+          this.comparePathPriority(left.item.path, right.item.path)
+      )
+      .slice(0, READ_LEDGER_MAX_ITEMS)
+      .map((ranked) => ranked.item);
+
+    const lines: string[] = [
+      "Use this as in-request memory. Files below were already read in this request.",
+      "Do NOT call read_file again for listed paths unless refresh=true is truly needed or file changed after write.",
+      terms.length > 0 ? `Current focus terms: ${terms.join(", ")}` : "Current focus terms: (none)"
+    ];
+
+    if (entries.length === 0) {
+      lines.push("Already-read files: (none yet).");
+      lines.push("If more evidence is needed, read one focused file, then continue execution.");
+      return truncate(lines.join("\n"), READ_LEDGER_CONTEXT_CHAR_LIMIT);
+    }
+
+    lines.push("Already-read files:");
+    for (const [index, entry] of entries.entries()) {
+      lines.push(
+        `- ${entry.path} :: reads=${entry.readCount} :: ${entry.summary || "summary unavailable"}`
+      );
+      if (index < READ_LEDGER_EXCERPT_ITEMS) {
+        const excerpt = this.extractReadCacheExcerpt(entry.payload, 180);
+        if (excerpt) {
+          lines.push(`  memory: ${excerpt}`);
+        }
+      }
+    }
+    lines.push("Execution hint: prefer write_file/run_command/complete_step using this memory instead of re-reading.");
+    return truncate(lines.join("\n"), READ_LEDGER_CONTEXT_CHAR_LIMIT);
+  }
+
   private normalizeActionType(rawType: string): string {
     const normalized = rawType.trim().toLowerCase();
     const aliases: Record<string, string> = {
@@ -2738,6 +3266,18 @@ export class LocalAgentRunner {
     return this.prefersVietnamese() ? vietnamese : english;
   }
 
+  private isStrictGuardMode(): boolean {
+    return this.config.guardMode === "strict";
+  }
+
+  private isBalancedGuardMode(): boolean {
+    return this.config.guardMode === "balanced";
+  }
+
+  private isRelaxedGuardMode(): boolean {
+    return this.config.guardMode === "relaxed";
+  }
+
   private toStreamPreview(value: string, maxChars = 900): string {
     const raw = value || "";
     const jsonStart = raw.indexOf("{");
@@ -2798,6 +3338,45 @@ export class LocalAgentRunner {
       }
     }
 
+    if (this.readCacheByPath.size > 0) {
+      const cachedEntries = Array.from(this.readCacheByPath.values())
+        .sort((a, b) => b.readCount - a.readCount || b.lastTurn - a.lastTurn || this.comparePathPriority(a.path, b.path))
+        .slice(0, 10);
+      lines.push("Request read cache (already read):");
+      for (const item of cachedEntries) {
+        lines.push(`- ${item.path} :: reads=${item.readCount} :: ${item.summary}`);
+      }
+      lines.push("- Re-read only when truly needed (use refresh=true) or after file changes.");
+    }
+
+    if (this.latestDiagnosticFiles.length > 0) {
+      lines.push("Latest diagnostics by file:");
+      for (const item of this.latestDiagnosticFiles.slice(0, 5)) {
+        const sample = item.samples.slice(0, 2).join(" | ");
+        lines.push(
+          `- ${item.path} :: total=${item.total}, errors=${item.errors}, warnings=${item.warnings}, infos=${item.infos}${
+            sample ? ` :: ${sample}` : ""
+          }`
+        );
+      }
+      const dominant = this.getDominantDiagnosticFile(BATCH_DIAGNOSTIC_TRIGGER_COUNT);
+      if (dominant) {
+        lines.push(
+          `- Batch-fix priority: ${dominant.path} has ${dominant.total} diagnostics. Read once and fix all in one pass before rerun command.`
+        );
+      }
+    }
+
+    if (this.batchFixState) {
+      lines.push("BatchFixGuard state:");
+      lines.push(
+        `- target=${this.batchFixState.path}, diagnostics=${this.batchFixState.issueCount} (${this.batchFixState.errors}E/${this.batchFixState.warnings}W/${this.batchFixState.infos}I), requiresWrite=${this.batchFixState.requiresWrite}`
+      );
+      lines.push(
+        "- In this mode: avoid list/search, do not patch chunk-by-chunk, perform one holistic write_file for target, then rerun verification."
+      );
+    }
+
     const recentOutcomes = this.stepOutcomeMemory.slice(-8);
     if (recentOutcomes.length > 0) {
       lines.push("Recent executed outcomes:");
@@ -2851,6 +3430,19 @@ export class LocalAgentRunner {
       this.pushStepMemory(`${step.id}: wrote ${pathValue}`);
       this.pendingValidationAfterWrite = true;
       this.verificationStatus = "not_run";
+      this.writeRevision += 1;
+      const normalizedPath = this.normalizeRelativePath(pathValue);
+      this.fileWriteRevisionByPath.set(normalizedPath, this.writeRevision);
+      this.readCacheByPath.delete(normalizedPath);
+      if (this.batchFixState && normalizedPath === this.batchFixState.path) {
+        this.batchFixState = {
+          ...this.batchFixState,
+          requiresWrite: false
+        };
+        this.callbacks.onLog(
+          `BatchFixGuard: write detected on target '${this.batchFixState.path}'. Verification rerun is now allowed.`
+        );
+      }
     }
 
     if (actionType === "run_command") {
@@ -2860,6 +3452,12 @@ export class LocalAgentRunner {
       this.pushStepMemory(
         `${step.id}: command ${actionResult.progress ? "ok" : "failed"} :: ${commandLabel} :: ${summary}`
       );
+      if (this.latestDiagnosticFiles.length > 0) {
+        const top = this.latestDiagnosticFiles[0];
+        this.pushStepMemory(
+          `${step.id}: diagnostics ${top.path} (${top.total} issue(s): ${top.errors}E/${top.warnings}W/${top.infos}I)`
+        );
+      }
     }
   }
 
@@ -2876,6 +3474,736 @@ export class LocalAgentRunner {
       return truncate(compact, 220);
     }
     return truncate(compact, 220);
+  }
+
+  private evaluateBatchFixGuard(actionType: string, action: AgentAction): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
+    const state = this.batchFixState;
+    if (!state) {
+      return undefined;
+    }
+    if (!this.pendingValidationAfterWrite && this.verificationStatus !== "failed") {
+      return undefined;
+    }
+    const targetPath = this.normalizeRelativePath(toStringValue(action.path).trim());
+    const verificationCommand =
+      actionType === "run_command" && this.isVerificationCommand(toStringValue(action.command));
+
+    if (actionType === "list_files" || actionType === "search_code") {
+      return this.t(
+        `BatchFixGuard: focus on '${state.path}' (${state.issueCount} diagnostics). Skip broad discovery and fix this file first.`,
+        `BatchFixGuard: tập trung vào '${state.path}' (${state.issueCount} lỗi/chẩn đoán). Không tìm kiếm lan man, hãy sửa file này trước.`
+      );
+    }
+
+    if (actionType === "read_file") {
+      if (targetPath && targetPath !== state.path) {
+        const stateDir = path.posix.dirname(state.path);
+        if (stateDir && stateDir !== "." && targetPath.startsWith(`${stateDir}/`)) {
+          return undefined;
+        }
+        return this.t(
+          `BatchFixGuard: read '${state.path}' only. Current batch-fix target has ${state.issueCount} diagnostics.`,
+          `BatchFixGuard: chỉ đọc '${state.path}'. File mục tiêu batch-fix hiện có ${state.issueCount} lỗi/chẩn đoán.`
+        );
+      }
+      return undefined;
+    }
+
+    if (actionType === "patch_file" || actionType === "append_file") {
+      return this.t(
+        `BatchFixGuard: do one holistic write_file for '${state.path}' instead of piecemeal ${actionType}.`,
+        `BatchFixGuard: dùng write_file toàn phần cho '${state.path}' thay vì ${actionType} từng mảnh.`
+      );
+    }
+
+    if (actionType === "write_file") {
+      if (!targetPath || targetPath !== state.path) {
+        return this.t(
+          `BatchFixGuard: write target must be '${state.path}' until diagnostics are reduced.`,
+          `BatchFixGuard: chỉ được ghi vào '${state.path}' cho tới khi giảm hết lỗi/chẩn đoán chính.`
+        );
+      }
+      return undefined;
+    }
+
+    if (verificationCommand) {
+      if (state.requiresWrite) {
+        return this.t(
+          `BatchFixGuard: verification is blocked until '${state.path}' is updated in one full write_file pass.`,
+          `BatchFixGuard: chưa được chạy verify cho tới khi '${state.path}' được cập nhật bằng một lần write_file toàn phần.`
+        );
+      }
+      return undefined;
+    }
+
+    if (actionType === "complete_step" || actionType === "final_answer") {
+      return this.t(
+        `BatchFixGuard: cannot ${actionType} while '${state.path}' still has unresolved diagnostics (${state.issueCount}).`,
+        `BatchFixGuard: chưa thể ${actionType} khi '${state.path}' còn lỗi/chẩn đoán chưa xử lý (${state.issueCount}).`
+      );
+    }
+
+    return undefined;
+  }
+
+  private async evaluatePostWriteVerificationGate(
+    actionType: string,
+    action: AgentAction
+  ): Promise<string | undefined> {
+    if (!this.pendingValidationAfterWrite || this.changedFiles.size <= 0) {
+      return undefined;
+    }
+
+    const verificationCommand =
+      actionType === "run_command" ? toStringValue(action.command).trim() : "";
+    const isVerificationRun = verificationCommand.length > 0 && this.isVerificationCommand(verificationCommand);
+
+    if (this.verificationStatus === "not_run") {
+      if (isVerificationRun) {
+        return undefined;
+      }
+      const suggested = await this.suggestVerificationCommand();
+      return suggested
+        ? this.t(
+            `QualityGuard: post-write verification is mandatory. Check syntax/type/lint/test now. Run: ${suggested}`,
+            `QualityGuard: sau khi ghi code bắt buộc phải verify. Hãy kiểm tra syntax/type/lint/test ngay. Chạy: ${suggested}`
+          )
+        : this.t(
+            "QualityGuard: post-write verification is mandatory. Run a syntax/type/lint/test command now.",
+            "QualityGuard: sau khi ghi code bắt buộc phải verify. Hãy chạy ngay lệnh kiểm tra syntax/type/lint/test."
+          );
+    }
+
+    if (this.verificationStatus === "failed") {
+      if (actionType === "complete_step" || actionType === "final_answer") {
+        const suggested = await this.suggestVerificationCommand();
+        return suggested
+          ? this.t(
+              `QualityGuard: verification is still failing. Fix all reported syntax/type/runtime issues, then rerun: ${suggested}`,
+              `QualityGuard: verify vẫn đang fail. Hãy sửa toàn bộ lỗi syntax/type/runtime đã báo, rồi chạy lại: ${suggested}`
+            )
+          : this.t(
+              "QualityGuard: verification is still failing. Fix all reported syntax/type/runtime issues, then rerun verification.",
+              "QualityGuard: verify vẫn đang fail. Hãy sửa toàn bộ lỗi syntax/type/runtime đã báo rồi chạy lại verify."
+            );
+      }
+      if (actionType === "run_command" && !isVerificationRun) {
+        const suggested = await this.suggestVerificationCommand();
+        return suggested
+          ? this.t(
+              `QualityGuard: do not run unrelated commands while code has failing diagnostics. Fix errors and rerun: ${suggested}`,
+              `QualityGuard: không chạy lệnh không liên quan khi code đang lỗi. Hãy sửa lỗi và chạy lại: ${suggested}`
+            )
+          : this.t(
+              "QualityGuard: do not run unrelated commands while code has failing diagnostics. Fix errors and rerun verification.",
+              "QualityGuard: không chạy lệnh không liên quan khi code đang lỗi. Hãy sửa lỗi và chạy lại verify."
+            );
+      }
+    }
+
+    return undefined;
+  }
+
+  private normalizeRelativePath(pathLike: string): string {
+    return pathLike.replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+  }
+
+  private isActionRefreshRequested(action: AgentAction): boolean {
+    const flags = [action.refresh, action.forceRefresh, action.force, action.bypassCache, action.reRead];
+    return flags.some((value) => value === true || String(value).toLowerCase() === "true");
+  }
+
+  private trimReadCache(): void {
+    if (this.readCacheByPath.size <= READ_CACHE_MAX_ENTRIES) {
+      return;
+    }
+    const items = Array.from(this.readCacheByPath.values()).sort(
+      (a, b) => a.lastTurn - b.lastTurn || a.readCount - b.readCount || a.path.localeCompare(b.path)
+    );
+    const removeCount = this.readCacheByPath.size - READ_CACHE_MAX_ENTRIES;
+    for (let index = 0; index < removeCount; index += 1) {
+      const target = items[index];
+      if (!target) {
+        continue;
+      }
+      this.readCacheByPath.delete(target.path);
+    }
+  }
+
+  private buildReadCachePromptContext(): string {
+    if (this.readCacheByPath.size === 0) {
+      return "(none)";
+    }
+    const ranked = Array.from(this.readCacheByPath.values())
+      .sort(
+        (a, b) =>
+          b.readCount - a.readCount ||
+          b.lastTurn - a.lastTurn ||
+          this.comparePathPriority(a.path, b.path)
+      )
+      .slice(0, 8);
+    const lines: string[] = [];
+    for (const item of ranked) {
+      const excerpt = this.extractReadCacheExcerpt(item.payload, 220);
+      lines.push(
+        `- ${item.path} :: ${item.summary} :: reads=${item.readCount}${item.isTruncated ? ` :: truncated(${item.sourceCharLength})` : ""}`
+      );
+      if (excerpt) {
+        lines.push(`  excerpt: ${excerpt}`);
+      }
+    }
+    return truncate(lines.join("\n"), READ_CACHE_PROMPT_CHAR_LIMIT);
+  }
+
+  private extractReadCacheExcerpt(payload: string, maxChars: number): string {
+    const marker = payload.indexOf("READ_MODE:");
+    if (marker < 0) {
+      return "";
+    }
+    const bodyStart = payload.indexOf("\n", marker);
+    if (bodyStart < 0) {
+      return "";
+    }
+    const body = payload.slice(bodyStart + 1).replace(/\s+/g, " ").trim();
+    if (!body) {
+      return "";
+    }
+    return truncate(body, maxChars);
+  }
+
+  private buildReadFilePayload(
+    relPath: string,
+    startLine: number,
+    endLine: number,
+    modeLabel: string,
+    chunk: string
+  ): { payload: string; isTruncated: boolean; sourceCharLength: number } {
+    const raw = `FILE ${relPath} [${startLine}-${endLine}]\nREAD_MODE: ${modeLabel}\n${chunk}`;
+    if (raw.length <= READ_FILE_RETURN_CHAR_LIMIT) {
+      return {
+        payload: raw,
+        isTruncated: false,
+        sourceCharLength: raw.length
+      };
+    }
+
+    const clipped = truncate(raw, READ_FILE_RETURN_CHAR_LIMIT);
+    return {
+      payload: clipped,
+      isTruncated: true,
+      sourceCharLength: raw.length
+    };
+  }
+
+  private formatReadCacheRecall(entry: ReadCacheEntry): string {
+    const excerpt = this.extractReadCacheExcerpt(entry.payload, 180);
+    const lines = [
+      `Cached memory: ${entry.path} :: ${entry.summary} :: reads=${entry.readCount}${entry.isTruncated ? ` :: truncated(${entry.sourceCharLength} chars)` : ""}`,
+      excerpt ? `Cached excerpt: ${excerpt}` : ""
+    ].filter(Boolean);
+    return lines.join("\n");
+  }
+
+  private async preloadRelatedReadCache(task: string, scope: TaskScopeProfile): Promise<void> {
+    const files = await this.getWorkspaceFileIndex(WORKSPACE_INDEX_LIMIT);
+    if (files.length === 0) {
+      return;
+    }
+
+    const focusTerms = scope.focusTerms.length > 0 ? scope.focusTerms : this.extractTaskFocusTerms(task, 8);
+    const languageHints = new Set(this.projectTechProfile.languages.map((item) => item.toLowerCase()));
+    const scored: Array<{ path: string; score: number }> = [];
+
+    for (const file of files) {
+      const lower = file.toLowerCase();
+      if (this.isFrameworkOrGeneratedPath(lower)) {
+        continue;
+      }
+      let score = 0;
+      if (focusTerms.length > 0 && this.pathMatchesFocusTerms(file, focusTerms)) {
+        score += 85;
+      }
+      if (scope.isTestTask) {
+        if (this.isLikelyTestFile(lower)) {
+          score += 28;
+        }
+        if (lower.startsWith("lib/") || lower.startsWith("src/")) {
+          score += 10;
+        }
+      } else if (lower.startsWith("lib/") || lower.startsWith("src/") || lower.startsWith("app/")) {
+        score += 18;
+      }
+      if (this.isContextBootstrapFile(lower)) {
+        score += 6;
+      }
+      const ext = path.extname(lower);
+      if ((languageHints.has("dart") && ext === ".dart") || (languageHints.has("typescript") && (ext === ".ts" || ext === ".tsx")) || (languageHints.has("javascript") && (ext === ".js" || ext === ".jsx"))) {
+        score += 12;
+      }
+      score += Math.max(0, 12 - this.getPathPriorityRank(file) * 2);
+      if (score > 0) {
+        scored.push({ path: file, score });
+      }
+    }
+
+    if (scored.length === 0) {
+      return;
+    }
+
+    scored.sort((a, b) => b.score - a.score || this.comparePathPriority(a.path, b.path));
+    const candidates = scored.slice(0, RELATED_PRELOAD_FILE_LIMIT).map((item) => item.path);
+    const loaded: string[] = [];
+
+    for (const relPath of candidates) {
+      try {
+        const normalized = this.normalizeRelativePath(relPath);
+        if (this.readCacheByPath.has(normalized)) {
+          continue;
+        }
+        const abs = this.resolveWorkspacePath(relPath);
+        const content = await fs.readFile(abs, "utf8");
+        const lines = content.split(/\r?\n/g);
+        const truncatedContent = truncate(content, RELATED_PRELOAD_FILE_CHAR_LIMIT);
+        const preloadPayload = this.buildReadFilePayload(
+          relPath,
+          1,
+          Math.max(1, lines.length),
+          "preload_cache",
+          truncatedContent
+        );
+        const payload = preloadPayload.payload;
+        const summary = this.buildReadSummaryFromToolMessage(payload);
+        this.readCacheByPath.set(normalized, {
+          path: normalized,
+          payload,
+          summary,
+          readCount: 1,
+          lastStepId: "PRELOAD",
+          lastTurn: 0,
+          fileWriteRevision: this.fileWriteRevisionByPath.get(normalized) ?? 0,
+          isTruncated: preloadPayload.isTruncated,
+          sourceCharLength: preloadPayload.sourceCharLength
+        });
+        this.readSummaryByPath.set(normalized, summary);
+        this.rememberPath(normalized);
+        loaded.push(normalized);
+      } catch {
+        // Ignore unreadable files.
+      }
+    }
+
+    this.trimReadCache();
+    if (loaded.length > 0) {
+      this.pushStepMemory(`PRELOAD: cached ${loaded.length} related file(s)`);
+      this.callbacks.onLog(
+        `ReadCachePreload: cached ${loaded.length} related file(s): ${loaded.slice(0, 8).join(", ")}`
+      );
+    }
+  }
+
+  private getNormalizedChangedFileSet(): Set<string> {
+    return new Set(
+      Array.from(this.changedFiles.values())
+        .map((item) => this.normalizeRelativePath(item))
+        .filter((item) => item.length > 0)
+    );
+  }
+
+  private getBlockingDiagnosticsForChangedFiles(): DiagnosticFileSummary[] {
+    if (this.latestDiagnosticFiles.length === 0) {
+      return [];
+    }
+    const strictDiagnostics = !this.isRelaxedGuardMode();
+    const changed = this.getNormalizedChangedFileSet();
+    if (changed.size === 0) {
+      return this.latestDiagnosticFiles.filter((item) =>
+        strictDiagnostics ? item.errors > 0 || item.warnings > 0 : item.errors > 0
+      );
+    }
+
+    const matched = this.latestDiagnosticFiles.filter((item) => {
+      const normalized = this.normalizeRelativePath(item.path);
+      return changed.has(normalized);
+    });
+    if (matched.length === 0) {
+      return [];
+    }
+
+    return matched.filter((item) =>
+      strictDiagnostics ? item.errors > 0 || item.warnings > 0 : item.errors > 0
+    );
+  }
+
+  private formatBlockingDiagnosticsSummary(items: DiagnosticFileSummary[]): string {
+    if (items.length === 0) {
+      return "";
+    }
+    return items
+      .slice(0, 3)
+      .map((item) => `${item.path}(${item.errors}E/${item.warnings}W/${item.infos}I)`)
+      .join(", ");
+  }
+
+  private evaluateVerificationLoopGuard(command: string): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
+    const commandKey = this.normalizeCommandKey(command);
+    if (!commandKey || !this.failedVerificationCommandKey) {
+      return undefined;
+    }
+    if (commandKey !== this.failedVerificationCommandKey) {
+      return undefined;
+    }
+    if (this.writeRevision !== this.failedVerificationWriteRevision) {
+      return undefined;
+    }
+    if (
+      !this.failedVerificationDiagnosticSignature ||
+      this.failedVerificationDiagnosticSignature !== this.latestDiagnosticSignature
+    ) {
+      return undefined;
+    }
+    const dominant = this.getDominantDiagnosticFile(1);
+    if (!dominant) {
+      return undefined;
+    }
+    return [
+      "VerificationLoopGuard: same verification command is repeating with unchanged diagnostics and no file writes.",
+      `Fix '${dominant.path}' first (${dominant.total} issue(s): ${dominant.errors}E/${dominant.warnings}W/${dominant.infos}I).`,
+      "Apply one focused write_file/patch_file pass, then rerun command."
+    ].join(" ");
+  }
+
+  private normalizeCommandKey(command: string): string {
+    return command.replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  private getDominantDiagnosticFile(minTotal = 1): DiagnosticFileSummary | undefined {
+    const first = this.latestDiagnosticFiles[0];
+    if (!first || first.total < Math.max(1, minTotal)) {
+      return undefined;
+    }
+    return first;
+  }
+
+  private captureDiagnosticsFromCommandOutput(
+    command: string,
+    output: string,
+    isVerificationCommand: boolean
+  ): string {
+    const issues = this.extractDiagnosticsFromLog(output);
+    const commandKey = this.normalizeCommandKey(command);
+    if (issues.length === 0) {
+      if (isVerificationCommand) {
+        this.latestDiagnosticIssues = [];
+        this.latestDiagnosticFiles = [];
+        this.latestDiagnosticSignature = "";
+        this.latestDiagnosticCommandKey = commandKey;
+        if (this.batchFixState) {
+          this.callbacks.onLog(`BatchFixGuard: cleared (verification output has no diagnostics).`);
+        }
+        this.batchFixState = undefined;
+      }
+      return "";
+    }
+
+    const summaries = this.summarizeDiagnosticsByFile(issues);
+    this.latestDiagnosticIssues = issues.slice(0, MAX_TRACKED_DIAGNOSTIC_ISSUES);
+    this.latestDiagnosticFiles = summaries.slice(0, MAX_TRACKED_DIAGNOSTIC_FILES);
+    this.latestDiagnosticSignature = this.buildDiagnosticsSignature(this.latestDiagnosticFiles);
+    this.latestDiagnosticCommandKey = commandKey;
+    this.updateBatchFixStateFromDiagnostics(commandKey, this.latestDiagnosticFiles, isVerificationCommand);
+
+    const top = this.latestDiagnosticFiles[0];
+    this.callbacks.onLog(
+      `DiagnosticsParser: command='${commandKey || "(empty)"}' files=${this.latestDiagnosticFiles.length} total=${this.latestDiagnosticIssues.length}${top ? ` top=${top.path}:${top.total}` : ""}`
+    );
+    return this.formatDiagnosticsSummaryForToolMessage(this.latestDiagnosticFiles);
+  }
+
+  private updateBatchFixStateFromDiagnostics(
+    commandKey: string,
+    files: DiagnosticFileSummary[],
+    isVerificationCommand: boolean
+  ): void {
+    if (!isVerificationCommand || files.length === 0) {
+      return;
+    }
+    const total = files.reduce((sum, item) => sum + item.total, 0);
+    const primary = files[0];
+    if (!primary) {
+      return;
+    }
+    const primaryShare = total > 0 ? primary.total / total : 0;
+    const shouldActivate =
+      primary.total >= BATCH_DIAGNOSTIC_TRIGGER_COUNT ||
+      (primary.errors >= Math.max(3, Math.floor(BATCH_DIAGNOSTIC_TRIGGER_COUNT / 2)) &&
+        primaryShare >= BATCH_DIAGNOSTIC_MIN_PRIMARY_SHARE);
+
+    if (!shouldActivate) {
+      if (this.batchFixState && this.batchFixState.path === primary.path) {
+        this.batchFixState = undefined;
+        this.callbacks.onLog(`BatchFixGuard: deactivated (dominant file no longer exceeds threshold).`);
+      }
+      return;
+    }
+
+    const signature = this.buildDiagnosticsSignature(files);
+    const prev = this.batchFixState;
+    this.batchFixState = {
+      path: primary.path,
+      issueCount: primary.total,
+      errors: primary.errors,
+      warnings: primary.warnings,
+      infos: primary.infos,
+      commandKey,
+      diagnosticSignature: signature,
+      requiresWrite: true,
+      activatedWriteRevision: this.writeRevision
+    };
+
+    const changedTarget = !prev || prev.path !== primary.path;
+    const changedCount = !prev || prev.issueCount !== primary.total;
+    const changedSig = !prev || prev.diagnosticSignature !== signature;
+    if (changedTarget || changedCount || changedSig) {
+      this.callbacks.onLog(
+        `BatchFixGuard: activated target='${primary.path}' issues=${primary.total} (${primary.errors}E/${primary.warnings}W/${primary.infos}I), share=${primaryShare.toFixed(2)}.`
+      );
+    }
+  }
+
+  private buildDiagnosticsSignature(files: DiagnosticFileSummary[]): string {
+    if (files.length === 0) {
+      return "";
+    }
+    return files
+      .slice(0, 8)
+      .map((item) => `${item.path}:${item.total}:${item.errors}:${item.warnings}:${item.infos}`)
+      .join("|");
+  }
+
+  private formatDiagnosticsSummaryForToolMessage(files: DiagnosticFileSummary[]): string {
+    if (files.length === 0) {
+      return "";
+    }
+    const total = files.reduce((sum, item) => sum + item.total, 0);
+    const lines: string[] = [`Diagnostics summary: ${total} issue(s) across ${files.length} file(s).`];
+    for (const item of files.slice(0, 6)) {
+      const sample = item.samples.slice(0, 2).join(" | ");
+      lines.push(
+        `- ${item.path}: ${item.total} issue(s) (${item.errors}E/${item.warnings}W/${item.infos}I)${
+          sample ? ` -> ${sample}` : ""
+        }`
+      );
+    }
+    const dominant = this.getDominantDiagnosticFile(BATCH_DIAGNOSTIC_TRIGGER_COUNT);
+    if (dominant) {
+      lines.push(
+        `BatchFixHint: '${dominant.path}' has many diagnostics. Read file once and fix all reported errors/warnings in one pass before rerun.`
+      );
+    }
+    return lines.join("\n");
+  }
+
+  private summarizeDiagnosticsByFile(issues: DiagnosticIssue[]): DiagnosticFileSummary[] {
+    const grouped = new Map<string, DiagnosticFileSummary>();
+    for (const issue of issues) {
+      const entry =
+        grouped.get(issue.path) ??
+        {
+          path: issue.path,
+          total: 0,
+          errors: 0,
+          warnings: 0,
+          infos: 0,
+          samples: []
+        };
+      entry.total += 1;
+      if (issue.severity === "error") {
+        entry.errors += 1;
+      } else if (issue.severity === "warning") {
+        entry.warnings += 1;
+      } else {
+        entry.infos += 1;
+      }
+      if (issue.message && entry.samples.length < 4) {
+        const sample = truncate(issue.message.replace(/\s+/g, " ").trim(), 120);
+        if (!entry.samples.includes(sample)) {
+          entry.samples.push(sample);
+        }
+      }
+      grouped.set(issue.path, entry);
+    }
+    return Array.from(grouped.values())
+      .sort((a, b) => b.errors - a.errors || b.total - a.total || b.warnings - a.warnings || a.path.localeCompare(b.path))
+      .slice(0, MAX_TRACKED_DIAGNOSTIC_FILES);
+  }
+
+  private extractDiagnosticsFromLog(log: string): DiagnosticIssue[] {
+    if (!log.trim()) {
+      return [];
+    }
+    const issues: DiagnosticIssue[] = [];
+    const seen = new Set<string>();
+    const lines = log.split(/\r?\n/g);
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line === "STDOUT:" || line === "STDERR:") {
+        continue;
+      }
+      const parsed = this.parseDiagnosticLine(line);
+      if (!parsed) {
+        continue;
+      }
+      const key = `${parsed.path}:${parsed.line}:${parsed.column}:${parsed.severity}:${parsed.message}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      issues.push(parsed);
+      if (issues.length >= MAX_TRACKED_DIAGNOSTIC_ISSUES) {
+        break;
+      }
+    }
+    return issues.sort(
+      (a, b) =>
+        (a.severity === "error" ? 0 : a.severity === "warning" ? 1 : 2) -
+          (b.severity === "error" ? 0 : b.severity === "warning" ? 1 : 2) ||
+        a.path.localeCompare(b.path) ||
+        a.line - b.line ||
+        a.column - b.column
+    );
+  }
+
+  private parseDiagnosticLine(line: string): DiagnosticIssue | undefined {
+    const normalize = (
+      rawPath: string,
+      rawLine: string,
+      rawColumn: string,
+      rawSeverity: string,
+      rawMessage: string,
+      rawCode?: string
+    ): DiagnosticIssue | undefined => {
+      const normalizedPath = this.normalizeDiagnosticPath(rawPath);
+      if (!normalizedPath) {
+        return undefined;
+      }
+      const lineNumber = Number(rawLine || "1");
+      const colNumber = Number(rawColumn || "1");
+      if (!Number.isFinite(lineNumber) || !Number.isFinite(colNumber)) {
+        return undefined;
+      }
+      const message = rawMessage.replace(/\s+/g, " ").trim();
+      if (!message) {
+        return undefined;
+      }
+      return {
+        path: normalizedPath,
+        line: Math.max(1, Math.floor(lineNumber)),
+        column: Math.max(1, Math.floor(colNumber)),
+        severity: this.normalizeDiagnosticSeverity(rawSeverity),
+        message,
+        code: rawCode?.trim() || undefined
+      };
+    };
+
+    const flutterBullet =
+      line.match(
+        /^(error|warning|info|hint)\s*[•-]\s*(.+?)\s*[•-]\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+):(\d+)(?:\s*[•-]\s*([A-Za-z0-9_/-]+))?$/i
+      ) ??
+      line.match(
+        /^(error|warning|info|hint)\s*[:|-]\s*(.+?)\s*[:|-]\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+):(\d+)(?:\s*[:|-]\s*([A-Za-z0-9_/-]+))?$/i
+      );
+    if (flutterBullet) {
+      return normalize(
+        flutterBullet[3] || "",
+        flutterBullet[4] || "1",
+        flutterBullet[5] || "1",
+        flutterBullet[1] || "error",
+        flutterBullet[2] || "",
+        flutterBullet[6]
+      );
+    }
+
+    const analyzer = line.match(
+      /^([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+):(\d+):\s*(error|warning|info|hint)\s*:?\s*(.+)$/i
+    );
+    if (analyzer) {
+      return normalize(
+        analyzer[1] || "",
+        analyzer[2] || "1",
+        analyzer[3] || "1",
+        analyzer[4] || "error",
+        analyzer[5] || ""
+      );
+    }
+
+    const tsc = line.match(
+      /^([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)\((\d+),(\d+)\):\s*(error|warning|info)(?:\s+([A-Za-z0-9_-]+))?:\s*(.+)$/i
+    );
+    if (tsc) {
+      return normalize(
+        tsc[1] || "",
+        tsc[2] || "1",
+        tsc[3] || "1",
+        tsc[4] || "error",
+        tsc[6] || "",
+        tsc[5]
+      );
+    }
+
+    const eslint = line.match(
+      /^([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)\s+(\d+):(\d+)\s+(error|warning|info)\s+(.+)$/i
+    );
+    if (eslint) {
+      return normalize(
+        eslint[1] || "",
+        eslint[2] || "1",
+        eslint[3] || "1",
+        eslint[4] || "error",
+        eslint[5] || ""
+      );
+    }
+
+    return undefined;
+  }
+
+  private normalizeDiagnosticPath(rawPath: string): string | undefined {
+    const cleaned = rawPath.replace(/[)\],]+$/, "").replace(/\\/g, "/").trim();
+    if (!cleaned || cleaned.startsWith("http://") || cleaned.startsWith("https://")) {
+      return undefined;
+    }
+    try {
+      const absolute = path.isAbsolute(cleaned)
+        ? path.normalize(cleaned)
+        : path.resolve(this.config.workspaceRoot, cleaned);
+      const relative = path.relative(this.config.workspaceRoot, absolute).split(path.sep).join("/");
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        return undefined;
+      }
+      const normalized = relative.replace(/^\.\/+/, "");
+      if (!normalized || this.isFrameworkOrGeneratedPath(normalized.toLowerCase())) {
+        return undefined;
+      }
+      return normalized;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private normalizeDiagnosticSeverity(rawSeverity: string): DiagnosticSeverity {
+    const lowered = rawSeverity.trim().toLowerCase();
+    if (lowered === "error") {
+      return "error";
+    }
+    if (lowered === "warning") {
+      return "warning";
+    }
+    return "info";
   }
 
   private recordFailure(stepId: string, actionType: string, action: AgentAction, message: string): void {
@@ -3487,6 +4815,9 @@ export class LocalAgentRunner {
   }
 
   private evaluateListPatternGuard(pattern: string): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
     if (this.taskExplicitlyAllowsFrameworkAccess()) {
       return undefined;
     }
@@ -3515,6 +4846,9 @@ export class LocalAgentRunner {
   }
 
   private evaluatePathAccessGuard(relPath: string, mode: "read" | "write"): string | undefined {
+    if (this.isRelaxedGuardMode() && mode === "read") {
+      return undefined;
+    }
     if (this.taskExplicitlyAllowsFrameworkAccess()) {
       return undefined;
     }
@@ -3533,6 +4867,9 @@ export class LocalAgentRunner {
     rawTarget: string,
     investigationCount: number
   ): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
     const scope = this.currentTaskScope;
     if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
       return undefined;
@@ -3586,6 +4923,9 @@ export class LocalAgentRunner {
   }
 
   private evaluateReadRelevanceGuard(relPath: string, investigationCount: number): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
     const scope = this.currentTaskScope;
     if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
       return undefined;
@@ -3683,6 +5023,7 @@ export class LocalAgentRunner {
     const checks = [
       /\btest\b/,
       /\blint\b/,
+      /\banalyze\b/,
       /\btypecheck\b/,
       /\btsc\b/,
       /\bcheck\b/,
@@ -3692,7 +5033,9 @@ export class LocalAgentRunner {
       /\bvitest\b/,
       /\bgo\s+test\b/,
       /\bcargo\s+test\b/,
-      /\bflutter\s+test\b/
+      /\bflutter\s+test\b/,
+      /\bflutter\s+analyze\b/,
+      /\bdart\s+analyze\b/
     ];
     return checks.some((pattern) => pattern.test(lower));
   }
@@ -4403,7 +5746,7 @@ export class LocalAgentRunner {
         continue;
       }
       if (
-        /^(npm run |pnpm |yarn |flutter |fvm flutter |pytest\b|go test\b|cargo test\b)/i.test(normalized)
+        /^(npm run |pnpm |yarn |flutter |fvm flutter |dart |pytest\b|go test\b|cargo test\b)/i.test(normalized)
       ) {
         return normalized;
       }
@@ -4415,14 +5758,15 @@ export class LocalAgentRunner {
     if (hasFlutter) {
       const hasFvm = hasFile(".fvm/fvm_config.json");
       const flutterCmd = hasFvm ? "fvm flutter" : "flutter";
+      const analyzeCmd = `${flutterCmd} analyze --no-fatal-infos`;
       if (isTestFlow) {
         if (changedTests.length > 0) {
           const target = changedTests[0];
-          return `${flutterCmd} test ${target}`;
+          return `${analyzeCmd} && ${flutterCmd} test ${target}`;
         }
-        return `${flutterCmd} test`;
+        return `${analyzeCmd} && ${flutterCmd} test`;
       }
-      return `${flutterCmd} analyze --no-fatal-infos`;
+      return analyzeCmd;
     }
 
     if (hasFile("package.json")) {
@@ -4981,6 +6325,9 @@ export class LocalAgentRunner {
     existsBeforeWrite: boolean,
     content: string
   ): Promise<string | undefined> {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
     const scope = this.currentTaskScope;
     if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
       return undefined;
@@ -5071,6 +6418,9 @@ export class LocalAgentRunner {
   }
 
   private evaluateCommandScopeGuard(command: string): string | undefined {
+    if (this.isRelaxedGuardMode()) {
+      return undefined;
+    }
     const scope = this.currentTaskScope;
     if (!scope || scope.scopeClass === "broad" || scope.allowRewrite) {
       return undefined;

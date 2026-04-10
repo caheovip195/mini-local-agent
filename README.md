@@ -24,8 +24,9 @@ Mo thu muc nay trong VSCode, sau do nhan `F5` de chay Extension Development Host
 Vao VSCode Settings, tim `localAgent`:
 
 - `localAgent.lmStudio.baseUrl`: mac dinh `http://127.0.0.1:1234/v1`
-- `localAgent.lmStudio.apiKey`: mac dinh `lm-studio`
+- `localAgent.lmStudio.apiKey`: mac dinh rong (`""`), phai dat token neu bat auth trong LM Studio
 - `localAgent.lmStudio.model`: ten model dang load trong LM Studio
+- `localAgent.provider.apiMode`: mac dinh `lm_rest_chat` de dung duoc thinking + mcp integrations native cua LM Studio
 - `localAgent.maxTurnsPerStep`: gioi han so turn/step
 - `localAgent.maxAskUser`: gioi han so lan duoc phep hoi user
 - `localAgent.minInvestigationsBeforeExecute`: so lan toi thieu phai list/search/read truoc khi write/run/complete

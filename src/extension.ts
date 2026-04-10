@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 
 import { LocalAgentRunner } from "./agent/runner";
 import { extractJsonObject } from "./utils";
@@ -8,11 +10,12 @@ import type {
   ExecutionPlan,
   StepStatus
 } from "./agent/types";
-import { LmStudioClient, type ThinkingEffort } from "./lmStudioClient";
+import { LmStudioClient, type ChatMessage, type ThinkingEffort } from "./lmStudioClient";
 import { LocalInlineCompletionProvider } from "./inlineCompletion";
+import { buildWebviewHtml } from "./webviewHtml";
 
 interface RunMode {
-  type: "plan" | "agent";
+  type: "plan" | "agent" | "chat";
 }
 
 type WebviewEvent =
@@ -23,6 +26,8 @@ type WebviewEvent =
   | { type: "done"; text: string }
   | { type: "error"; text: string }
   | { type: "running"; value: boolean }
+  | { type: "chat_message"; role: "user" | "assistant"; text: string; timestamp: string }
+  | { type: "thinking"; text?: string; clear?: boolean }
   | {
       type: "models";
       items: string[];
@@ -33,8 +38,8 @@ type WebviewEvent =
     }
   | { type: "usage_reset" }
   | {
-      type: "usage";
-      phase: "preflight" | "planner" | "executor";
+    type: "usage";
+      phase: "preflight" | "planner" | "executor" | "chat";
       stepId?: string;
       turn?: number;
       model?: string;
@@ -90,15 +95,27 @@ type WebviewEvent =
   | { type: "session_cleared" };
 
 interface LmSettings {
-  providerPreset: "lmstudio" | "openrouter" | "custom";
+  providerPreset: "lmstudio" | "custom";
+  apiMode: "chat_completions" | "responses" | "lm_rest_chat";
   providerName: string;
   baseUrl: string;
   apiKey: string;
+  apiKeySource: "lmStudio.apiKey" | "provider.apiKey" | "none";
   model: string;
   modelsPath: string;
   chatPath: string;
+  presetName: string;
   headers: Record<string, string>;
-  quickOpenRouter: boolean;
+  extraBody: Record<string, unknown>;
+  lmStudioIntegrations: string[];
+}
+
+interface ModelBootstrapState {
+  items: string[];
+  selected: string;
+  baseUrl: string;
+  info?: string;
+  error?: string;
 }
 
 interface UsageTotals {
@@ -141,16 +158,23 @@ interface ConversationHistoryEntry {
   status: "done" | "error" | "cancelled";
 }
 
+interface ChatTranscriptEntry {
+  role: "user" | "assistant";
+  text: string;
+  timestamp: string;
+}
+
 const HISTORY_STORAGE_KEY = "localAgent.conversationHistory.v1";
 const LEARNING_STORAGE_KEY = "localAgent.learningMemory.v1";
+const CHAT_TRANSCRIPT_STORAGE_KEY = "localAgent.chatTranscript.v1";
 const HISTORY_LIMIT = 40;
 const LEARNING_LIMIT = 60;
+const CHAT_TURN_LIMIT = 80;
 const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
-const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
-  output.appendLine("Local Agent Coder v0.0.36 activated");
+  output.appendLine(`Local Agent Coder v${String((context.extension as unknown as { packageJSON?: { version?: string } }).packageJSON?.version ?? "unknown")} activated`);
   const provider = new LocalAgentViewProvider(context, output);
   const inlineProvider = new LocalInlineCompletionProvider(output);
 
@@ -183,8 +207,9 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.commands.executeCommand("workbench.view.extension.localAgent");
       await provider.run(prompt, { type: "plan" });
     }),
-    vscode.commands.registerCommand("localAgent.setupOpenRouterSimple", async () => {
-      await provider.setupOpenRouterSimple();
+    vscode.commands.registerCommand("localAgent.reloadModels", async () => {
+      await vscode.commands.executeCommand("workbench.view.extension.localAgent");
+      await provider.reloadModelsFromCommand();
     })
   );
 }
@@ -204,7 +229,15 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   private usageTotals: UsageTotals = { prompt: 0, completion: 0, total: 0 };
   private history: ConversationHistoryEntry[] = [];
   private learningMemory: LearningMemoryEntry[] = [];
+  private chatSession: ChatMessage[] = [];
+  private chatTranscript: ChatTranscriptEntry[] = [];
   private sessionResetAtMs = 0;
+  private modelBootstrap: ModelBootstrapState = {
+    items: [],
+    selected: "",
+    baseUrl: DEFAULT_LM_BASE_URL
+  };
+  private didBootstrapRebuild = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -212,9 +245,11 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.output.appendLine("resolveWebviewView: init");
     this.view = webviewView;
     this.webviewReady = false;
     this.pendingEvents = [];
+    this.didBootstrapRebuild = false;
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -223,6 +258,14 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     this.history = this.readHistory();
     this.learningMemory = this.readLearningMemory();
+    this.chatTranscript = this.readChatTranscript();
+    this.chatSession = this.chatTranscript.map((entry) => ({ role: entry.role, content: entry.text }));
+    const lm = this.readLmSettings();
+    this.modelBootstrap = {
+      items: lm.model ? [lm.model] : [],
+      selected: lm.model,
+      baseUrl: lm.baseUrl || DEFAULT_LM_BASE_URL
+    };
 
     webviewView.webview.onDidReceiveMessage(async (message: unknown) => {
       if (!message || typeof message !== "object") {
@@ -243,7 +286,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
         case "run": {
           const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
-          const mode = payload.mode === "plan" ? "plan" : "agent";
+          const mode = payload.mode === "plan" ? "plan" : payload.mode === "chat" ? "chat" : "agent";
           const model = typeof payload.model === "string" ? payload.model.trim() : "";
           const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl.trim() : "";
           const thinkingEnabled =
@@ -270,19 +313,15 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         }
 
         case "load_models": {
-          if (this.running) {
-            this.output.appendLine("load_models ignored: agent run is in progress.");
-            this.post({
-              type: "status",
-              text: "Đang chạy agent, tạm thời không reload models."
-            });
-            return;
-          }
           const preferredModel = typeof payload.preferredModel === "string" ? payload.preferredModel : undefined;
           const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl : undefined;
           this.output.appendLine(
             `load_models request preferred=${preferredModel || "-"} baseUrl=${(baseUrl || "").trim() || "-"}`
           );
+          this.post({
+            type: "status",
+            text: "Đang tải lại model list..."
+          });
           await this.loadModels(preferredModel, baseUrl);
           return;
         }
@@ -293,7 +332,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         }
 
         case "clear_session": {
-          this.clearSession();
+          await this.clearSession();
           return;
         }
 
@@ -321,60 +360,20 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         this.view = undefined;
         this.webviewReady = false;
         this.pendingEvents = [];
+        this.didBootstrapRebuild = false;
       }
     });
 
     void this.loadModels(undefined, this.readLmSettings().baseUrl);
     this.postHistory();
+    this.postChatTranscript();
   }
 
-  async setupOpenRouterSimple(): Promise<void> {
-    const cfg = vscode.workspace.getConfiguration("localAgent");
-    const existingKey = cfg.get<string>("openRouter.apiKey", "").trim();
-    const existingModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim() || "openrouter/auto";
-
-    const keyInput = await vscode.window.showInputBox({
-      prompt: "OpenRouter API key",
-      placeHolder: "sk-or-v1-...",
-      password: true,
-      ignoreFocusOut: true
-    });
-    if (keyInput === undefined) {
-      return;
-    }
-
-    const nextApiKey = keyInput.trim().length > 0 ? keyInput.trim() : existingKey;
-    if (!nextApiKey) {
-      vscode.window.showErrorMessage("OpenRouter API key is required.");
-      return;
-    }
-
-    const modelInput = await vscode.window.showInputBox({
-      prompt: "OpenRouter model (simple mode)",
-      placeHolder: "openrouter/auto",
-      value: existingModel,
-      ignoreFocusOut: true
-    });
-    if (modelInput === undefined) {
-      return;
-    }
-    const nextModel = modelInput.trim() || "openrouter/auto";
-
-    try {
-      await Promise.all([
-        cfg.update("openRouter.simpleMode", true, vscode.ConfigurationTarget.Workspace),
-        cfg.update("openRouter.apiKey", nextApiKey, vscode.ConfigurationTarget.Workspace),
-        cfg.update("openRouter.model", nextModel, vscode.ConfigurationTarget.Workspace),
-        cfg.update("provider.preset", "openrouter", vscode.ConfigurationTarget.Workspace)
-      ]);
-      this.output.appendLine(`OpenRouter simple setup saved. model=${nextModel}`);
-      void this.loadModels(nextModel, DEFAULT_OPENROUTER_BASE_URL);
-      vscode.window.showInformationMessage("OpenRouter simple mode is enabled.");
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      this.output.appendLine(`OpenRouter simple setup failed: ${text}`);
-      vscode.window.showErrorMessage(`OpenRouter setup failed: ${text}`);
-    }
+  async reloadModelsFromCommand(): Promise<void> {
+    const lm = this.readLmSettings();
+    this.output.appendLine(`manual reload command invoked baseUrl=${lm.baseUrl || "-"}`);
+    this.post({ type: "status", text: "Đang tải lại model list..." });
+    await this.loadModels(lm.model, lm.baseUrl);
   }
 
   async run(
@@ -397,14 +396,6 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
 
     const lmSettings = this.readLmSettings();
-    if (lmSettings.providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(lmSettings.apiKey)) {
-      this.post({
-        type: "error",
-        text:
-          "OpenRouter API key is missing. Set localAgent.openRouter.apiKey (simple mode) or localAgent.provider.apiKey."
-      });
-      return;
-    }
     const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : lmSettings.model;
     const selectedBaseUrl = this.normalizeBaseUrl(baseUrlOverride || lmSettings.baseUrl, lmSettings.baseUrl);
     const defaultThinking = this.readThinkingSettings();
@@ -432,8 +423,26 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
     this.output.appendLine(`Task mode=${mode.type}`);
     this.output.appendLine(`Provider=${lmSettings.providerName}`);
+    this.output.appendLine(`API mode=${lmSettings.apiMode}`);
     this.output.appendLine(`Model=${selectedModel}`);
     this.output.appendLine(`BaseURL=${selectedBaseUrl}`);
+    this.output.appendLine(`ChatPath=${config.chatPath}`);
+    if (lmSettings.presetName) {
+      this.output.appendLine(`LM Studio preset=${lmSettings.presetName}`);
+    } else if (mode.type === "chat" && lmSettings.providerPreset === "lmstudio") {
+      this.output.appendLine(
+        "LM Studio preset is empty. If you rely on a custom LM Studio system prompt, set localAgent.lmStudio.preset/localAgent.provider.presetName so API requests use that preset."
+      );
+    }
+    if (lmSettings.providerPreset === "lmstudio" && lmSettings.apiMode === "chat_completions") {
+      this.output.appendLine(
+        "Warning: LM Studio MCP servers are not available on /v1/chat/completions. Use localAgent.provider.apiMode='lm_rest_chat' (or chat mode auto MCP fallback) to use mcp.json integrations."
+      );
+      this.post({
+        type: "log",
+        text: "LM Studio MCP is disabled on /v1/chat/completions. Switch localAgent.provider.apiMode to 'lm_rest_chat' to use local mcp.json integrations."
+      });
+    }
     this.output.appendLine(`Thinking=${selectedThinkingEnabled ? selectedThinkingEffort : "off"}`);
     this.output.appendLine(`Prompt: ${prompt}`);
 
@@ -447,13 +456,76 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       type: "status",
       text:
         preferredLanguage === "Vietnamese"
-          ? mode.type === "plan"
-            ? "Đang lập kế hoạch..."
-            : "Đang lập kế hoạch và thực thi..."
-          : mode.type === "plan"
-            ? "Planning..."
+          ? mode.type === "chat"
+            ? "Đang chat..."
+            : mode.type === "plan"
+              ? "Đang lập kế hoạch..."
+              : "Đang lập kế hoạch và thực thi..."
+          : mode.type === "chat"
+            ? "Chatting..."
+            : mode.type === "plan"
+              ? "Planning..."
             : "Planning + executing..."
     });
+    this.post({
+      type: "log",
+      text: `Run started: mode=${mode.type}, model=${selectedModel}, baseUrl=${selectedBaseUrl}, thinking=${selectedThinkingEnabled ? selectedThinkingEffort : "off"}, apiMode=${lmSettings.apiMode}`
+    });
+    if (mode.type !== "chat") {
+      this.post({
+        type: "chat_message",
+        role: "assistant",
+        text:
+          preferredLanguage === "Vietnamese"
+            ? mode.type === "plan"
+              ? `Đã bắt đầu lập kế hoạch bằng model ${selectedModel}.`
+              : `Đã bắt đầu chạy agent bằng model ${selectedModel}.`
+            : mode.type === "plan"
+              ? `Planning started with model ${selectedModel}.`
+              : `Agent run started with model ${selectedModel}.`,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    let chatIntegrations =
+      mode.type === "chat" && lmSettings.providerPreset === "lmstudio"
+        ? await this.resolveLmStudioIntegrations(lmSettings.lmStudioIntegrations)
+        : [];
+    let chatPathForRun =
+      mode.type === "chat" &&
+      lmSettings.providerPreset === "lmstudio" &&
+      (lmSettings.apiMode === "lm_rest_chat" || chatIntegrations.length > 0)
+        ? "/api/v1/chat"
+        : config.chatPath;
+    if (lmSettings.providerPreset === "lmstudio" && lmSettings.presetName && chatPathForRun === "/api/v1/chat") {
+      chatPathForRun = "/chat/completions";
+      if (chatIntegrations.length > 0) {
+        this.output.appendLine(
+          "LM Studio preset is set. Native /api/v1/chat does not support preset key, so integrations are disabled for this run."
+        );
+        this.post({
+          type: "log",
+          text: "Preset requires /v1/chat/completions. MCP integrations are disabled for this run."
+        });
+        chatIntegrations = [];
+      }
+      this.output.appendLine(
+        `LM Studio preset compatibility: auto-switched chat path to ${chatPathForRun} (preset=${lmSettings.presetName}).`
+      );
+      this.post({
+        type: "log",
+        text: `Using preset '${lmSettings.presetName}' via /v1/chat/completions.`
+      });
+    }
+    if (mode.type === "chat" && chatIntegrations.length > 0) {
+      this.output.appendLine(
+        `LM Studio MCP integrations enabled for chat: ${chatIntegrations.join(", ")} (path=${chatPathForRun})`
+      );
+      this.post({
+        type: "log",
+        text: `Using LM Studio MCP integrations: ${chatIntegrations.join(", ")}`
+      });
+    }
 
     const client = new LmStudioClient({
       providerName: config.providerName,
@@ -461,101 +533,182 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       apiKey: config.apiKey,
       model: config.model,
       modelsPath: config.modelsPath,
-      chatPath: config.chatPath,
-      headers: config.headers
+      chatPath: chatPathForRun,
+      headers: config.headers,
+      extraBody: config.extraBody,
+      onDebug: (message) => this.output.appendLine(message)
     });
 
     let executionSummary =
       mode.type === "plan"
         ? "Plan created."
-        : "Execution finished.";
+        : mode.type === "chat"
+          ? "Chat completed."
+          : "Execution finished.";
     let preflightSummary = "";
     let runStatus: ConversationHistoryEntry["status"] = "done";
     let latestPlan: ExecutionPlan | undefined;
     const stepStatuses = new Map<string, StepStatus>();
     const thinkingEffortForChat: ThinkingEffort | undefined = selectedThinkingEnabled ? selectedThinkingEffort : undefined;
 
-    const runner = new LocalAgentRunner(client, config.agentConfig, {
-      onLog: (message) => {
-        this.output.appendLine(message);
-        this.post({ type: "log", text: message });
-      },
-      onStatus: (message) => {
-        this.post({ type: "status", text: message });
-      },
-      onPlan: (plan) => {
-        latestPlan = plan;
-        for (const step of plan.steps) {
-          stepStatuses.set(step.id, step.status);
-        }
-        this.post({ type: "plan", plan });
-      },
-      onStepStatus: (stepId, status) => {
-        stepStatuses.set(stepId, status);
-        this.post({ type: "step", stepId, status });
-      },
-      onDone: (summary) => {
-        executionSummary = summary;
-        this.post({ type: "done", text: summary });
-      },
-      onUsage: (event) => {
-        this.pushUsageEvent({
-          phase: event.phase,
-          stepId: event.stepId,
-          turn: event.turn,
-          model: event.model,
-          promptTokens: event.promptTokens,
-          completionTokens: event.completionTokens,
-          totalTokens: event.totalTokens
-        });
-      },
-      onAction: (event) => {
-        this.post({
-          type: "activity",
-          stepId: event.stepId,
-          turn: event.turn,
-          actionType: event.actionType,
-          status: event.status,
-          detail: event.detail
-        });
-      },
-      onStream: (event) => {
-        this.post({
-          type: "stream",
-          phase: event.phase,
-          stepId: event.stepId,
-          turn: event.turn,
-          streamId: event.streamId,
-          text: event.text,
-          done: event.done
-        });
-      },
-      onQuestion: async (question) => {
-        const value = await vscode.window.showInputBox({
-          prompt: `Agent needs input: ${question}`,
-          placeHolder: "Leave empty to continue with default assumptions",
-          ignoreFocusOut: true
-        });
-        return value?.trim() || "No additional input provided. Continue with best assumption.";
-      }
-    });
+    const runner =
+      mode.type === "chat"
+        ? undefined
+        : new LocalAgentRunner(client, config.agentConfig, {
+            onLog: (message) => {
+              this.output.appendLine(message);
+              this.post({ type: "log", text: message });
+            },
+            onStatus: (message) => {
+              this.post({ type: "status", text: message });
+            },
+            onPlan: (plan) => {
+              latestPlan = plan;
+              for (const step of plan.steps) {
+                stepStatuses.set(step.id, step.status);
+              }
+              this.post({ type: "plan", plan });
+            },
+            onStepStatus: (stepId, status) => {
+              stepStatuses.set(stepId, status);
+              this.post({ type: "step", stepId, status });
+            },
+            onDone: (summary) => {
+              executionSummary = summary;
+              this.post({ type: "done", text: summary });
+            },
+            onUsage: (event) => {
+              this.pushUsageEvent({
+                phase: event.phase,
+                stepId: event.stepId,
+                turn: event.turn,
+                model: event.model,
+                promptTokens: event.promptTokens,
+                completionTokens: event.completionTokens,
+                totalTokens: event.totalTokens
+              });
+            },
+            onAction: (event) => {
+              this.post({
+                type: "activity",
+                stepId: event.stepId,
+                turn: event.turn,
+                actionType: event.actionType,
+                status: event.status,
+                detail: event.detail
+              });
+            },
+            onStream: (event) => {
+              this.post({
+                type: "stream",
+                phase: event.phase,
+                stepId: event.stepId,
+                turn: event.turn,
+                streamId: event.streamId,
+                text: event.text,
+                done: event.done
+              });
+            },
+            onQuestion: async (question) => {
+              const value = await vscode.window.showInputBox({
+                prompt: `Agent needs input: ${question}`,
+                placeHolder: "Leave empty to continue with default assumptions",
+                ignoreFocusOut: true
+              });
+              return value?.trim() || "No additional input provided. Continue with best assumption.";
+            }
+          });
 
     try {
-      this.post({ type: "status", text: "Summarizing conversation memory..." });
-      const preflight = await this.buildPreflightTask(
-        client,
-        prompt,
-        mode,
-        this.abortController.signal,
-        preferredLanguage,
-        thinkingEffortForChat
-      );
-      preflightSummary = preflight.preflightSummary;
-      this.output.appendLine(`Preflight summary: ${preflightSummary}`);
-      this.post({ type: "log", text: `Preflight summary:\n${preflightSummary}` });
-
-      if (mode.type === "plan") {
-        const plan = await runner.createPlan(preflight.compactTask, this.abortController.signal);
+      if (mode.type === "chat") {
+        preflightSummary = "Built-in preflight prompt disabled. Chat-only mode.";
+        const userTimestamp = new Date().toISOString();
+        await this.appendChatTranscript("user", prompt, userTimestamp);
+        this.post({ type: "chat_message", role: "user", text: prompt, timestamp: userTimestamp });
+        this.post({ type: "thinking", text: preferredLanguage === "Vietnamese" ? "Đang suy nghĩ..." : "Thinking..." });
+        const chatGuardPrompt =
+          "You are a coding assistant in VS Code. Reply in the same language as the user. Use clean Markdown formatting (headings, lists, code blocks, tables when useful). If the model supports reasoning channel, keep reasoning there and keep final answer readable.";
+        let thinkingBuffer = "";
+        let lastThinkingPushAt = 0;
+        let sawReasoningDelta = false;
+        let answerDeltaChars = 0;
+        const pushThinking = (force = false): void => {
+          const trimmed = thinkingBuffer.trim();
+          if (!trimmed) {
+            return;
+          }
+          const now = Date.now();
+          if (!force && now - lastThinkingPushAt < 120) {
+            return;
+          }
+          lastThinkingPushAt = now;
+          this.post({ type: "thinking", text: trimmed.slice(-6000) });
+        };
+        const messages: ChatMessage[] = [
+          { role: "system", content: chatGuardPrompt },
+          ...this.chatSession,
+        ];
+        const response = await client.chat(messages, this.abortController.signal, {
+          temperature: 0.25,
+          maxTokens: 1600,
+          stream: true,
+          onDelta: (delta) => {
+            const chunk = String(delta || "");
+            if (!chunk) {
+              return;
+            }
+            answerDeltaChars += chunk.length;
+            if (sawReasoningDelta) {
+              return;
+            }
+            const progressText =
+              preferredLanguage === "Vietnamese"
+                ? `Đang soạn câu trả lời... (${answerDeltaChars} ký tự)`
+                : `Generating answer... (${answerDeltaChars} chars)`;
+            thinkingBuffer = progressText;
+            pushThinking(false);
+          },
+          onReasoningDelta: (delta) => {
+            const next = String(delta || "");
+            if (!next.trim()) {
+              return;
+            }
+            sawReasoningDelta = true;
+            thinkingBuffer += next;
+            pushThinking(false);
+          },
+          thinkingEnabled: selectedThinkingEnabled,
+          thinkingEffort: thinkingEffortForChat,
+          integrations: chatIntegrations
+        });
+        if (response.usage) {
+          this.pushUsageEvent({
+            phase: "chat",
+            model: response.model,
+            promptTokens: response.usage.promptTokens,
+            completionTokens: response.usage.completionTokens,
+            totalTokens: response.usage.totalTokens
+          });
+        }
+        if (!thinkingBuffer.trim() && response.reasoning && response.reasoning.trim()) {
+          thinkingBuffer = response.reasoning.trim();
+          pushThinking(true);
+        }
+        const answer = this.normalizeChatAnswer(response.content);
+        if (!answer) {
+          throw new Error("Model did not return a final answer text.");
+        }
+        const assistantTimestamp = new Date().toISOString();
+        await this.appendChatTranscript("assistant", answer, assistantTimestamp);
+        this.post({ type: "chat_message", role: "assistant", text: answer, timestamp: assistantTimestamp });
+        this.post({ type: "thinking", clear: true });
+        executionSummary = this.trimForPrompt(answer, 1200);
+        this.post({ type: "done", text: preferredLanguage === "Vietnamese" ? "Chat xong." : "Chat completed." });
+      } else if (mode.type === "plan") {
+        preflightSummary = "Built-in preflight prompt disabled. Using raw user request.";
+        this.output.appendLine(`Preflight summary: ${preflightSummary}`);
+        this.post({ type: "log", text: `Preflight summary:\n${preflightSummary}` });
+        const plan = await runner!.createPlan(prompt, this.abortController.signal);
         this.post({ type: "plan", plan });
         this.post({
           type: "done",
@@ -563,7 +716,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         });
         executionSummary = `Plan created with ${plan.steps.length} steps.`;
       } else {
-        await runner.run(preflight.compactTask, this.abortController.signal);
+        preflightSummary = "Built-in preflight prompt disabled. Using raw user request.";
+        this.output.appendLine(`Preflight summary: ${preflightSummary}`);
+        this.post({ type: "log", text: `Preflight summary:\n${preflightSummary}` });
+        await runner!.run(prompt, this.abortController.signal);
       }
     } catch (error) {
       runStatus = this.abortController?.signal.aborted ? "cancelled" : "error";
@@ -571,36 +727,12 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       executionSummary = text;
       this.output.appendLine(`Error: ${text}`);
       this.post({ type: "error", text });
+      this.post({ type: "thinking", clear: true });
     } finally {
       const remainingSteps = this.collectRemainingSteps(latestPlan, stepStatuses);
       let learningNote = "";
-
-      if (mode.type === "agent" && runStatus !== "cancelled") {
-        try {
-          const learning = await this.buildLearningNote(client, {
-            prompt,
-            preflightSummary,
-            runSummary: executionSummary,
-            status: runStatus,
-            remainingSteps
-          }, preferredLanguage, thinkingEffortForChat);
-          learningNote = learning.lesson;
-          await this.appendLearningMemory({
-            id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-            timestamp: new Date().toISOString(),
-            status: runStatus,
-            task: this.trimForPrompt(prompt, 600),
-            lesson: learning.lesson,
-            rules: learning.rules
-          });
-          this.output.appendLine(`Learning note: ${learning.lesson}`);
-          if (learning.rules.length > 0) {
-            this.post({ type: "log", text: `Learning rules: ${learning.rules.join(" | ")}` });
-          }
-        } catch (learningError) {
-          const text = learningError instanceof Error ? learningError.message : String(learningError);
-          this.output.appendLine(`Learning note skipped: ${text}`);
-        }
+      if (mode.type === "agent") {
+        learningNote = "Built-in learning prompt disabled for LM Studio system prompt testing.";
       }
 
       try {
@@ -626,16 +758,20 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private clearSession(): void {
+  private async clearSession(): Promise<void> {
     if (this.running) {
       this.post({ type: "error", text: "Stop current run before clearing session." });
       return;
     }
 
     this.sessionResetAtMs = Date.now();
+    this.chatSession = [];
+    this.chatTranscript = [];
+    await this.context.workspaceState.update(CHAT_TRANSCRIPT_STORAGE_KEY, this.chatTranscript);
     this.resetUsage();
     this.post({ type: "session_cleared" });
     this.post({ type: "status", text: "Session cleared. Ready for a new request." });
+    this.post({ type: "thinking", clear: true });
     this.output.appendLine(`Session cleared at ${new Date(this.sessionResetAtMs).toISOString()}`);
   }
 
@@ -645,7 +781,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   }
 
   private pushUsageEvent(event: {
-    phase: "preflight" | "planner" | "executor";
+    phase: "preflight" | "planner" | "executor" | "chat";
     stepId?: string;
     turn?: number;
     model?: string;
@@ -678,6 +814,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     mode: RunMode,
     signal: AbortSignal,
     preferredLanguage: string,
+    thinkingEnabled?: boolean,
     thinkingEffort?: ThinkingEffort
   ): Promise<{ compactTask: string; preflightSummary: string }> {
     const sessionHistory = this.getActiveSessionHistoryEntries();
@@ -798,6 +935,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       {
         temperature: 0.1,
         maxTokens: 700,
+        thinkingEnabled,
         thinkingEffort,
         responseFormat: "json_object"
       }
@@ -1186,6 +1324,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       remainingSteps: RemainingStepEntry[];
     },
     preferredLanguage: string,
+    thinkingEnabled?: boolean,
     thinkingEffort?: ThinkingEffort
   ): Promise<{ lesson: string; rules: string[] }> {
     const remainingBlock =
@@ -1228,6 +1367,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       {
         temperature: 0.1,
         maxTokens: 260,
+        thinkingEnabled,
         thinkingEffort,
         responseFormat: "json_object"
       }
@@ -1325,7 +1465,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           return undefined;
         }
 
-        const mode = row.mode === "plan" ? "plan" : "agent";
+        const mode = row.mode === "plan" ? "plan" : row.mode === "chat" ? "chat" : "agent";
         const statusRaw = this.toText(row.status, "done");
         const status: ConversationHistoryEntry["status"] =
           statusRaw === "error" || statusRaw === "cancelled" ? statusRaw : "done";
@@ -1369,18 +1509,56 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private readChatTranscript(): ChatTranscriptEntry[] {
+    const raw = this.context.workspaceState.get<unknown[]>(CHAT_TRANSCRIPT_STORAGE_KEY, []);
+    if (!Array.isArray(raw)) {
+      return [];
+    }
+    return raw
+      .map((item): ChatTranscriptEntry | undefined => {
+        if (!item || typeof item !== "object") {
+          return undefined;
+        }
+        const row = item as Record<string, unknown>;
+        const role: ChatTranscriptEntry["role"] = row.role === "user" ? "user" : "assistant";
+        const text = this.toText(row.text, "");
+        if (!text) {
+          return undefined;
+        }
+        return {
+          role,
+          text: this.trimForPrompt(text, 4000),
+          timestamp: this.toText(row.timestamp, new Date().toISOString())
+        };
+      })
+      .filter((entry): entry is ChatTranscriptEntry => Boolean(entry))
+      .slice(-CHAT_TURN_LIMIT);
+  }
+
+  private async appendChatTranscript(role: "user" | "assistant", text: string, timestamp: string): Promise<void> {
+    const normalized: ChatTranscriptEntry = {
+      role,
+      text: this.trimForPrompt(text, 4000),
+      timestamp: this.toText(timestamp, new Date().toISOString())
+    };
+    this.chatTranscript = [...this.chatTranscript, normalized].slice(-CHAT_TURN_LIMIT);
+    this.chatSession = this.chatTranscript.map((entry) => ({ role: entry.role, content: entry.text }));
+    await this.context.workspaceState.update(CHAT_TRANSCRIPT_STORAGE_KEY, this.chatTranscript);
+  }
+
+  private postChatTranscript(): void {
+    for (const item of this.chatTranscript) {
+      this.post({ type: "chat_message", role: item.role, text: item.text, timestamp: item.timestamp });
+    }
+  }
+
   private async persistLmSelection(model: string, baseUrl: string): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("localAgent");
     const updates: Array<Thenable<unknown>> = [];
-    const preset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const quickOpenRouter = cfg.get<boolean>("openRouter.simpleMode", false) && preset === "openrouter";
 
     if (model.trim()) {
       updates.push(cfg.update("lmStudio.model", model, vscode.ConfigurationTarget.Workspace));
       updates.push(cfg.update("provider.model", model, vscode.ConfigurationTarget.Workspace));
-      if (quickOpenRouter) {
-        updates.push(cfg.update("openRouter.model", model, vscode.ConfigurationTarget.Workspace));
-      }
     }
 
     if (baseUrl.trim()) {
@@ -1415,36 +1593,57 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const lm = this.readLmSettings();
     const selectedBaseUrl = this.normalizeBaseUrl(baseUrlOverride || lm.baseUrl, lm.baseUrl);
     const fallbackModel = preferredModel || lm.model;
-    if (lm.providerPreset === "openrouter" && this.isMissingOpenRouterApiKey(lm.apiKey)) {
-      const message =
-        "OpenRouter API key is missing. Set localAgent.openRouter.apiKey (simple mode) or localAgent.provider.apiKey.";
-      this.output.appendLine(`loadModels blocked: ${message}`);
-      this.post({
-        type: "models",
-        items: [fallbackModel],
-        selected: fallbackModel,
-        baseUrl: selectedBaseUrl,
-        error: message
-      });
-      return;
-    }
+    this.output.appendLine(
+      `loadModels start provider=${lm.providerName} apiMode=${lm.apiMode} baseUrl=${selectedBaseUrl} preferred=${preferredModel || "-"} auth=${lm.apiKeySource}${lm.apiKey ? "(set)" : "(empty)"}`
+    );
 
     try {
-      const client = new LmStudioClient({
-        providerName: lm.providerName,
-        baseUrl: selectedBaseUrl,
-        apiKey: lm.apiKey,
-        model: fallbackModel,
-        modelsPath: lm.modelsPath,
-        chatPath: lm.chatPath,
-        headers: lm.headers
-      });
+      const createClient = (modelsPath: string) =>
+        new LmStudioClient({
+          providerName: lm.providerName,
+          baseUrl: selectedBaseUrl,
+          apiKey: lm.apiKey,
+          model: fallbackModel,
+          modelsPath,
+          chatPath: lm.chatPath,
+          headers: lm.headers,
+          extraBody: lm.extraBody,
+          onDebug: (message) => this.output.appendLine(message)
+        });
 
-      const models = await client.listModels();
+      let modelsPathUsed = lm.modelsPath;
+      let models: string[] = [];
+      try {
+        const timeoutMs = 12000;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          models = await createClient(modelsPathUsed).listModels(controller.signal);
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch (firstError) {
+        if (lm.modelsPath !== "/models") {
+          this.output.appendLine(
+            `loadModels retry with /models after failure at ${lm.modelsPath}: ${firstError instanceof Error ? firstError.message : String(firstError)}`
+          );
+          modelsPathUsed = "/models";
+          const timeoutMs = 12000;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            models = await createClient(modelsPathUsed).listModels(controller.signal);
+          } finally {
+            clearTimeout(timer);
+          }
+        } else {
+          throw firstError;
+        }
+      }
       const items = models.length > 0 ? models : [fallbackModel];
       const selected = items.includes(fallbackModel) ? fallbackModel : items[0];
       this.output.appendLine(
-        `loadModels ok provider=${lm.providerName} baseUrl=${selectedBaseUrl} count=${items.length} selected=${selected}`
+        `loadModels ok provider=${lm.providerName} apiMode=${lm.apiMode} baseUrl=${selectedBaseUrl} modelsPath=${modelsPathUsed} chatPath=${lm.chatPath} preset=${lm.presetName || "-"} count=${items.length} selected=${selected}`
       );
 
       this.post({
@@ -1454,26 +1653,43 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         baseUrl: selectedBaseUrl,
         info: `Loaded ${items.length} model(s) from ${lm.providerName}.`
       });
+      this.modelBootstrap = {
+        items,
+        selected,
+        baseUrl: selectedBaseUrl,
+        info: `Loaded ${items.length} model(s) from ${lm.providerName}.`
+      };
+      this.rebuildWebviewIfNotReady("models_loaded_before_ready");
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
+      const normalizedText = /aborted|cancelled|canceled/i.test(text)
+        ? "Model load timed out after 12s. Please verify LM Studio server is reachable at this URL."
+        : text;
       this.output.appendLine(`loadModels failed baseUrl=${selectedBaseUrl} error=${text}`);
       this.post({
         type: "models",
         items: [fallbackModel],
         selected: fallbackModel,
         baseUrl: selectedBaseUrl,
-        error: `Could not load models: ${text}`
+        error: `Could not load models: ${normalizedText}`
       });
+      this.modelBootstrap = {
+        items: [fallbackModel],
+        selected: fallbackModel,
+        baseUrl: selectedBaseUrl,
+        error: `Could not load models: ${normalizedText}`
+      };
+      this.rebuildWebviewIfNotReady("models_error_before_ready");
     }
   }
 
-  private isMissingOpenRouterApiKey(value: string): boolean {
-    const key = value.trim();
-    if (!key) {
-      return true;
+  private rebuildWebviewIfNotReady(reason: string): void {
+    if (!this.view || this.webviewReady || this.didBootstrapRebuild) {
+      return;
     }
-    const placeholder = new Set(["lm-studio", "your-openrouter-key", "changeme", "none"]);
-    return placeholder.has(key.toLowerCase());
+    this.didBootstrapRebuild = true;
+    this.output.appendLine(`webview rebuild fallback reason=${reason}`);
+    this.view.webview.html = this.getHtml();
   }
 
   private normalizeBaseUrl(input: string, fallback: string): string {
@@ -1558,93 +1774,84 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   private readLmSettings(): LmSettings {
     const cfg = vscode.workspace.getConfiguration("localAgent");
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
-    const legacyApiKey = cfg.get<string>("lmStudio.apiKey", "lm-studio");
+    const legacyApiKey = this.normalizeApiKey(cfg.get<string>("lmStudio.apiKey", ""));
     const legacyModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
-    const quickOpenRouterConfigured = cfg.get<boolean>("openRouter.simpleMode", false);
-    const quickOpenRouterApiKey = cfg.get<string>("openRouter.apiKey", "").trim();
-    const quickOpenRouterModel = cfg.get<string>("openRouter.model", "openrouter/auto").trim();
-    const quickOpenRouterSiteUrl = cfg.get<string>("openRouter.siteUrl", "").trim();
-    const quickOpenRouterAppName = cfg.get<string>("openRouter.appName", "Local Agent Coder").trim();
 
     const rawPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const configuredPreset: LmSettings["providerPreset"] =
-      rawPreset === "openrouter" || rawPreset === "custom" ? rawPreset : "lmstudio";
+    const configuredPreset: LmSettings["providerPreset"] = rawPreset === "custom" ? "custom" : "lmstudio";
     const providerPreset: LmSettings["providerPreset"] = configuredPreset;
-    const quickOpenRouter = quickOpenRouterConfigured && providerPreset === "openrouter";
+    const apiModeInspect = cfg.inspect<string>("provider.apiMode");
+    const hasUserApiModeOverride =
+      typeof apiModeInspect?.workspaceFolderValue === "string" ||
+      typeof apiModeInspect?.workspaceValue === "string" ||
+      typeof apiModeInspect?.globalValue === "string";
+    const rawApiMode = cfg.get<string>("provider.apiMode", "lm_rest_chat").trim().toLowerCase();
+    let apiMode: LmSettings["apiMode"] =
+      rawApiMode === "chat_completions"
+        ? "chat_completions"
+        : rawApiMode === "lm_rest_chat"
+          ? "lm_rest_chat"
+          : "responses";
+    if (configuredPreset === "lmstudio" && !hasUserApiModeOverride) {
+      apiMode = "lm_rest_chat";
+    }
+    const configuredPresetName = cfg.get<string>("provider.presetName", "").trim();
+    const legacyLmPreset = cfg.get<string>("lmStudio.preset", "").trim();
+    const presetName = configuredPresetName || legacyLmPreset;
 
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
-    const providerApiKey = cfg.get<string>("provider.apiKey", "").trim();
+    const providerApiKey = this.normalizeApiKey(cfg.get<string>("provider.apiKey", ""));
     const providerModel = cfg.get<string>("provider.model", "").trim();
     const providerModelsPath = this.normalizeApiPath(cfg.get<string>("provider.modelsPath", "/models"), "/models");
-    const providerChatPath = this.normalizeApiPath(
-      cfg.get<string>("provider.chatPath", "/chat/completions"),
-      "/chat/completions"
-    );
+    const providerChatPathDefault =
+      apiMode === "responses" ? "/responses" : apiMode === "lm_rest_chat" ? "/api/v1/chat" : "/chat/completions";
+    const providerChatPathRaw = cfg.get<string>("provider.chatPath", providerChatPathDefault);
+    const providerChatPathNormalized = this.normalizeApiPath(providerChatPathRaw, providerChatPathDefault);
+    const providerChatPath =
+      apiMode === "responses" && providerChatPathNormalized === "/chat/completions"
+        ? "/responses"
+        : providerChatPathNormalized;
+    const lmStudioIntegrations = this.normalizeIntegrationIds(cfg.get<string[]>("lmStudio.integrations", []));
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
+    const extraBody = this.parseBodyJson(cfg.get<string>("provider.extraBody", "{}"));
+    if (presetName.length > 0 && !Object.prototype.hasOwnProperty.call(extraBody, "preset")) {
+      extraBody.preset = presetName;
+    }
 
     let baseUrl = legacyBaseUrl;
-    let apiKey = legacyApiKey;
+    let apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+    let apiKeySource: LmSettings["apiKeySource"] =
+      providerApiKey.length > 0 ? "provider.apiKey" : legacyApiKey.length > 0 ? "lmStudio.apiKey" : "none";
     let model = legacyModel;
     let modelsPath = "/models";
-    let chatPath = "/chat/completions";
+    let chatPath = providerChatPath;
     let headers: Record<string, string> = {};
 
-    if (providerPreset === "openrouter") {
-      baseUrl = quickOpenRouter
-        ? DEFAULT_OPENROUTER_BASE_URL
-        : providerBaseUrl.length > 0
-          ? providerBaseUrl
-          : DEFAULT_OPENROUTER_BASE_URL;
-      apiKey = quickOpenRouter
-        ? quickOpenRouterApiKey || providerApiKey || legacyApiKey
-        : providerApiKey || quickOpenRouterApiKey || legacyApiKey;
-      model = quickOpenRouter
-        ? quickOpenRouterModel || providerModel || legacyModel
-        : providerModel || quickOpenRouterModel || legacyModel;
-      modelsPath = quickOpenRouter ? "/models" : providerModelsPath;
-      chatPath = quickOpenRouter ? "/chat/completions" : providerChatPath;
-      headers = { ...extraHeaders };
-    } else if (providerPreset === "custom") {
+    if (providerPreset === "custom") {
       baseUrl = providerBaseUrl.length > 0 ? providerBaseUrl : legacyBaseUrl;
       apiKey = providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+      apiKeySource = providerApiKey.length > 0 ? "provider.apiKey" : legacyApiKey.length > 0 ? "lmStudio.apiKey" : "none";
       model = providerModel.length > 0 ? providerModel : legacyModel;
       modelsPath = providerModelsPath;
       chatPath = providerChatPath;
       headers = { ...extraHeaders };
     }
-
-    if (providerPreset === "openrouter") {
-      const configuredSiteUrl = cfg.get<string>("provider.openRouterSiteUrl", "").trim();
-      const configuredAppName = cfg.get<string>("provider.openRouterAppName", "Local Agent Coder").trim();
-      const siteUrl = quickOpenRouter ? quickOpenRouterSiteUrl || configuredSiteUrl : configuredSiteUrl;
-      const appName = quickOpenRouter ? quickOpenRouterAppName || configuredAppName : configuredAppName;
-      if (siteUrl.length > 0) {
-        headers["HTTP-Referer"] = siteUrl;
-      }
-      if (appName.length > 0) {
-        headers["X-Title"] = appName;
-      }
-    }
-
-    const providerName =
-      providerPreset === "openrouter"
-        ? quickOpenRouter
-          ? "OpenRouter (Simple)"
-          : "OpenRouter"
-        : providerPreset === "custom"
-          ? "Custom API"
-          : "LM Studio";
+    const providerName = providerPreset === "custom" ? "Custom API" : "LM Studio";
 
     return {
       providerPreset,
+      apiMode,
       providerName,
       baseUrl,
       apiKey,
+      apiKeySource,
       model,
       modelsPath,
       chatPath,
+      presetName,
       headers,
-      quickOpenRouter
+      extraBody,
+      lmStudioIntegrations
     };
   }
 
@@ -1676,6 +1883,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     modelsPath: string;
     chatPath: string;
     headers: Record<string, string>;
+    extraBody: Record<string, unknown>;
     agentConfig: AgentConfig;
   } {
     const cfg = vscode.workspace.getConfiguration("localAgent");
@@ -1689,16 +1897,19 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       modelsPath: lm.modelsPath,
       chatPath: lm.chatPath,
       headers: lm.headers,
+      extraBody: lm.extraBody,
       agentConfig: {
         workspaceRoot,
         preferredLanguage,
+        guardMode: this.normalizeGuardMode(cfg.get<string>("guardMode", "relaxed")),
         thinkingEnabled: thinkingSettings.enabled,
         thinkingEffort: thinkingSettings.effort,
-        strictResponsibilityMode: cfg.get<boolean>("strictResponsibilityMode", true),
+        systemPromptMode: this.normalizeSystemPromptMode(cfg.get<string>("systemPromptMode", "strict")),
+        strictResponsibilityMode: cfg.get<boolean>("strictResponsibilityMode", false),
         maxTurnsPerStep: cfg.get<number>("maxTurnsPerStep", 14),
         executorMaxTokens: cfg.get<number>("executorMaxTokens", 7000),
-        maxAskUser: cfg.get<number>("maxAskUser", 0),
-        minInvestigationsBeforeExecute: cfg.get<number>("minInvestigationsBeforeExecute", 3),
+        maxAskUser: cfg.get<number>("maxAskUser", 1),
+        minInvestigationsBeforeExecute: cfg.get<number>("minInvestigationsBeforeExecute", 1),
         strategyCandidates: cfg.get<number>("strategyCandidates", 3),
         commandTimeoutMs: cfg.get<number>("commandTimeoutMs", 120000),
         autoApplyWrites: cfg.get<boolean>("autoApplyWrites", true),
@@ -1713,6 +1924,49 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       return fallback;
     }
     return raw.startsWith("/") ? raw : `/${raw}`;
+  }
+
+  private normalizeGuardMode(value: unknown): "strict" | "balanced" | "relaxed" {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (raw === "strict" || raw === "balanced" || raw === "relaxed") {
+      return raw;
+    }
+    return "relaxed";
+  }
+
+  private normalizeSystemPromptMode(value: unknown): "strict" | "provider_first" {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (raw === "provider_first" || raw === "provider-first" || raw === "providerfirst") {
+      return "provider_first";
+    }
+    return "strict";
+  }
+
+  private normalizeChatAnswer(value: string): string {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return "";
+    }
+    const withoutLedger = raw.replace(/\n{0,2}LEDGER_UPDATE[\s\S]*$/i, "").trim();
+    const cleaned = withoutLedger
+      .replace(/^thinking process:\s*/i, "")
+      .replace(/^reasoning:\s*/i, "")
+      .trim();
+    return cleaned;
+  }
+
+  private normalizeApiKey(value: unknown): string {
+    const raw = String(value ?? "").trim();
+    if (!raw) {
+      return "";
+    }
+    if (raw.toLowerCase() === "lm-studio") {
+      return "";
+    }
+    if (/^bearer\s+/i.test(raw)) {
+      return raw.replace(/^bearer\s+/i, "").trim();
+    }
+    return raw;
   }
 
   private parseHeaderJson(raw: string): Record<string, string> {
@@ -1743,1343 +1997,77 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private parseBodyJson(raw: string): Record<string, unknown> {
+    const text = raw.trim();
+    if (!text) {
+      return {};
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+
+      const out: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const normalizedKey = key.trim();
+        if (!normalizedKey || value === undefined) {
+          continue;
+        }
+        out[normalizedKey] = value;
+      }
+      return out;
+    } catch {
+      this.output.appendLine("provider.extraBody parse failed. Expected JSON object.");
+      return {};
+    }
+  }
+
+  private normalizeIntegrationIds(items: readonly string[]): string[] {
+    if (!Array.isArray(items)) {
+      return [];
+    }
+    const out: string[] = [];
+    for (const value of items) {
+      const raw = String(value ?? "").trim();
+      if (!raw) {
+        continue;
+      }
+      const normalized = raw.startsWith("mcp/") ? raw : `mcp/${raw}`;
+      out.push(normalized);
+    }
+    return Array.from(new Set(out));
+  }
+
+  private async resolveLmStudioIntegrations(configured: string[]): Promise<string[]> {
+    const normalizedConfigured = this.normalizeIntegrationIds(configured);
+    if (normalizedConfigured.length > 0) {
+      return normalizedConfigured;
+    }
+
+    const mcpPath = `${os.homedir()}/.lmstudio/mcp.json`;
+    try {
+      const raw = await fs.readFile(mcpPath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const servers = parsed?.mcpServers;
+      if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+        return [];
+      }
+      const labels = Object.keys(servers).map((key) => key.trim()).filter((key) => key.length > 0);
+      const discovered = this.normalizeIntegrationIds(labels);
+      if (discovered.length > 0) {
+        this.output.appendLine(`Discovered LM Studio MCP integrations from ${mcpPath}: ${discovered.join(", ")}`);
+      }
+      return discovered;
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`No LM Studio mcp.json integrations discovered: ${text}`);
+      return [];
+    }
+  }
+
   private getHtml(): string {
-    const nonce = createNonce();
-    const thinking = this.readThinkingSettings();
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-  <title>Local Agent</title>
-  <style>
-    :root {
-      --bg-0: #0f1c22;
-      --bg-1: #122933;
-      --card: rgba(14, 28, 36, 0.76);
-      --card-strong: rgba(10, 22, 30, 0.9);
-      --line: rgba(127, 182, 168, 0.26);
-      --line-strong: rgba(127, 182, 168, 0.45);
-      --text: #eaf7f3;
-      --text-soft: #9bc4b8;
-      --accent: #4bd7ab;
-      --accent-2: #2cb88e;
-      --warn: #f0ae5a;
-      --danger: #ef7b7b;
-      --ok: #5cda9f;
-      --shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      height: 100%;
-    }
-
-    body {
-      margin: 0;
-      padding: 12px;
-      color: var(--text);
-      background:
-        radial-gradient(circle at 10% -10%, #1f4f53 0%, transparent 35%),
-        radial-gradient(circle at 95% 5%, #153b4f 0%, transparent 28%),
-        linear-gradient(160deg, var(--bg-0) 0%, var(--bg-1) 100%);
-      font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 12px;
-      line-height: 1.5;
-      min-height: 100%;
-      overflow: auto;
-    }
-
-    .app {
-      min-height: 100%;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.9fr);
-      gap: 12px;
-      align-items: start;
-    }
-
-    .col {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
-    .col-main {
-      min-width: 0;
-    }
-
-    .col-side {
-      min-width: 0;
-    }
-
-    .panel {
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: linear-gradient(180deg, rgba(21, 39, 47, 0.92) 0%, var(--card) 100%);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(8px);
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .panel.hero {
-      background: linear-gradient(155deg, rgba(19, 44, 52, 0.95) 0%, rgba(9, 23, 30, 0.95) 100%);
-      border-color: var(--line-strong);
-    }
-
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    .title {
-      font-size: 14px;
-      font-weight: 700;
-      letter-spacing: 0.2px;
-      color: #f3fffc;
-    }
-
-    .hint {
-      color: var(--text-soft);
-      font-size: 11px;
-      line-height: 1.45;
-    }
-
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      border: 1px solid rgba(127, 182, 168, 0.42);
-      background: rgba(35, 78, 75, 0.4);
-      color: #dffff3;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-weight: 700;
-      max-width: 100%;
-      white-space: nowrap;
-      text-overflow: ellipsis;
-      overflow: hidden;
-    }
-
-    .fields {
-      display: grid;
-      gap: 8px;
-    }
-
-    .row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .grow {
-      flex: 1;
-      min-width: 150px;
-    }
-
-    .control-label {
-      color: var(--text-soft);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.45px;
-      margin-bottom: 4px;
-    }
-
-    textarea, select, input, button {
-      font: inherit;
-    }
-
-    textarea,
-    select,
-    input[type="text"] {
-      width: 100%;
-      border: 1px solid rgba(129, 186, 171, 0.35);
-      border-radius: 12px;
-      background: rgba(5, 14, 20, 0.44);
-      color: #ecfffa;
-      transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
-    }
-
-    textarea:focus,
-    select:focus,
-    input[type="text"]:focus {
-      outline: none;
-      border-color: rgba(94, 216, 176, 0.86);
-      box-shadow: 0 0 0 3px rgba(56, 186, 146, 0.18);
-      background: rgba(5, 14, 20, 0.62);
-    }
-
-    select,
-    input[type="text"] {
-      padding: 9px 10px;
-      min-height: 36px;
-    }
-
-    textarea {
-      min-height: 128px;
-      resize: vertical;
-      padding: 11px 12px;
-      line-height: 1.5;
-    }
-
-    textarea::placeholder,
-    input::placeholder {
-      color: rgba(164, 199, 189, 0.75);
-    }
-
-    .task-actions {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 8px;
-    }
-
-    button {
-      border: 1px solid rgba(132, 190, 174, 0.3);
-      border-radius: 12px;
-      padding: 9px 10px;
-      background: rgba(28, 55, 59, 0.66);
-      color: #e8fff8;
-      cursor: pointer;
-      font-weight: 700;
-      transition: transform 100ms ease, border-color 120ms ease, background 120ms ease;
-    }
-
-    button:hover {
-      border-color: rgba(124, 210, 181, 0.64);
-      background: rgba(36, 74, 78, 0.78);
-      transform: translateY(-1px);
-    }
-
-    button.primary {
-      border-color: rgba(76, 229, 181, 0.68);
-      background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 100%);
-      color: #03241b;
-    }
-
-    button.warn {
-      border-color: rgba(239, 123, 123, 0.58);
-      background: rgba(103, 36, 44, 0.75);
-      color: #ffe7e7;
-    }
-
-    button:disabled {
-      cursor: not-allowed;
-      opacity: 0.5;
-      transform: none;
-    }
-
-    .toggle-wrap {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 8px 10px;
-      border-radius: 12px;
-      border: 1px solid rgba(130, 186, 171, 0.35);
-      background: rgba(8, 20, 25, 0.48);
-      color: #d7f4eb;
-      min-height: 36px;
-    }
-
-    .toggle-wrap input[type="checkbox"] {
-      width: 14px;
-      height: 14px;
-      accent-color: var(--accent);
-      margin: 0;
-    }
-
-    .meta-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-    }
-
-    .metric {
-      border: 1px solid rgba(129, 186, 171, 0.3);
-      border-radius: 12px;
-      background: rgba(8, 20, 25, 0.5);
-      padding: 9px;
-    }
-
-    .metric .k {
-      color: var(--text-soft);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-    }
-
-    .metric .v {
-      font-size: 15px;
-      font-weight: 700;
-      margin-top: 2px;
-      color: #f1fffb;
-    }
-
-    .progress {
-      border: 1px solid rgba(129, 186, 171, 0.32);
-      border-radius: 999px;
-      height: 10px;
-      overflow: hidden;
-      background: rgba(8, 20, 25, 0.56);
-    }
-
-    .progress > div {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, #41d9a9 0%, #6dd4f6 100%);
-      transition: width 130ms ease;
-    }
-
-    .list,
-    .activity,
-    .logs {
-      overflow: auto;
-      border: 1px solid rgba(129, 186, 171, 0.28);
-      border-radius: 12px;
-      background: rgba(6, 16, 21, 0.5);
-      padding: 8px;
-      max-height: min(42vh, 420px);
-    }
-
-    .list {
-      list-style: none;
-      margin: 0;
-      display: grid;
-      gap: 7px;
-    }
-
-    .activity {
-      display: grid;
-      gap: 7px;
-    }
-
-    .item,
-    .activity-card {
-      border: 1px solid rgba(129, 186, 171, 0.26);
-      border-radius: 11px;
-      padding: 8px;
-      background: rgba(15, 33, 39, 0.74);
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-
-    .item[data-status="in_progress"] {
-      border-color: rgba(240, 174, 90, 0.76);
-      background: rgba(80, 58, 21, 0.45);
-    }
-
-    .item[data-status="done"] {
-      border-color: rgba(92, 218, 159, 0.7);
-      background: rgba(20, 64, 48, 0.48);
-    }
-
-    .item[data-status="failed"] {
-      border-color: rgba(239, 123, 123, 0.7);
-      background: rgba(86, 34, 43, 0.46);
-    }
-
-    .activity-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .history-row {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: center;
-      margin-bottom: 6px;
-      flex-wrap: wrap;
-    }
-
-    .history-meta {
-      color: var(--text-soft);
-      font-size: 10px;
-    }
-
-    .history-btn {
-      border: 1px solid rgba(129, 186, 171, 0.45);
-      background: rgba(33, 75, 72, 0.64);
-      color: #e1fff5;
-      border-radius: 9px;
-      font-size: 11px;
-      padding: 5px 8px;
-      font-weight: 700;
-    }
-
-    .badge {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      border-radius: 999px;
-      padding: 2px 8px;
-      background: rgba(63, 136, 118, 0.35);
-      color: #dbfff3;
-      border: 1px solid rgba(109, 184, 162, 0.56);
-    }
-
-    .badge.blocked {
-      background: rgba(141, 96, 26, 0.4);
-      color: #ffe8b9;
-      border-color: rgba(240, 174, 90, 0.72);
-    }
-
-    .badge.recovery {
-      background: rgba(77, 59, 114, 0.45);
-      color: #e7d7ff;
-      border-color: rgba(169, 134, 231, 0.65);
-    }
-
-    .mono {
-      font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
-      font-size: 11px;
-    }
-
-    .logs {
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-
-    .error {
-      color: var(--danger);
-    }
-
-    .done {
-      color: var(--ok);
-    }
-
-    body[data-density="compact"] .task-actions {
-      grid-template-columns: 1fr 1fr;
-    }
-
-    body[data-density="compact"] .meta-grid {
-      grid-template-columns: 1fr;
-    }
-
-    @media (max-width: 1200px) {
-      .layout {
-        grid-template-columns: minmax(0, 1fr);
-      }
-
-      .list,
-      .activity,
-      .logs {
-        max-height: min(34vh, 360px);
-      }
-    }
-
-    @media (max-width: 760px) {
-      body {
-        padding: 8px;
-      }
-
-      .task-actions {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .list,
-      .activity,
-      .logs {
-        max-height: min(30vh, 300px);
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="app">
-    <div class="panel hero">
-      <div class="header">
-        <div class="title">Local Agent Coder</div>
-        <div id="status" class="status-pill">Idle</div>
-      </div>
-      <div class="hint">Plan mode only creates steps. Run Agent will execute tools and file changes.</div>
-    </div>
-
-    <div class="layout">
-      <div class="col col-main">
-        <div class="panel">
-          <div class="header">
-            <div class="title">Task</div>
-            <div id="runMeta" class="hint">Mode: - | Model: - | Thinking: off</div>
-          </div>
-
-          <div class="fields">
-            <div>
-              <div class="control-label">API Base URL</div>
-              <div class="row">
-                <div class="grow">
-                  <input id="baseUrlInput" type="text" placeholder="LM Studio / OpenRouter URL (e.g. http://127.0.0.1:1234/v1)" />
-                </div>
-                <button id="reloadModels" type="button">Reload Models</button>
-              </div>
-            </div>
-
-            <div>
-              <div class="control-label">Model</div>
-              <select id="modelSelect"></select>
-              <div id="modelInfo" class="hint" style="margin-top:6px;"></div>
-            </div>
-
-            <div>
-              <div class="control-label">Reasoning</div>
-              <div class="row">
-                <label class="toggle-wrap">
-                  <input id="thinkingToggle" type="checkbox" />
-                  Thinking mode
-                </label>
-                <div style="width: 170px; max-width: 100%;">
-                  <select id="thinkingEffort">
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                  </select>
-                </div>
-              </div>
-              <div class="hint">Enable when task is complex and needs deeper reasoning.</div>
-            </div>
-          </div>
-
-          <div class="control-label" style="margin-top:2px;">Request</div>
-          <textarea id="prompt" placeholder="Describe exactly what to build, fix, or test..."></textarea>
-
-          <div class="task-actions">
-            <button id="planBtn" type="button">Plan Only</button>
-            <button id="runBtn" class="primary" type="button">Run Agent</button>
-            <button id="stopBtn" class="warn" type="button">Stop</button>
-            <button id="clearSessionBtn" type="button">Clear Session</button>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="header">
-            <div class="title">Plan Progress</div>
-            <div id="stepStats" class="hint">0/0 done</div>
-          </div>
-          <div class="progress"><div id="progressBar"></div></div>
-          <ul id="plan" class="list"></ul>
-        </div>
-      </div>
-
-      <div class="col col-side">
-        <div class="panel">
-          <div class="title">Token Usage</div>
-          <div class="meta-grid">
-            <div class="metric"><div class="k">Prompt</div><div id="tokPrompt" class="v">0</div></div>
-            <div class="metric"><div class="k">Completion</div><div id="tokCompletion" class="v">0</div></div>
-            <div class="metric"><div class="k">Total</div><div id="tokTotal" class="v">0</div></div>
-            <div class="metric"><div class="k">Last Call</div><div id="tokLast" class="v">-</div></div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="header">
-            <div class="title">History</div>
-            <div class="hint">Saved per workspace</div>
-          </div>
-          <div id="history" class="activity"></div>
-        </div>
-
-        <div class="panel">
-          <div class="header">
-            <div class="title">Agent Activity</div>
-            <div class="hint">Realtime action timeline</div>
-          </div>
-          <div id="activity" class="activity"></div>
-        </div>
-
-        <div class="panel">
-          <div class="header">
-            <div class="title">Logs</div>
-            <div class="hint">Runtime debug</div>
-          </div>
-          <div id="logs" class="logs mono"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const bootThinkingEnabled = ${thinking.enabled ? "true" : "false"};
-    const bootThinkingEffort = ${JSON.stringify(thinking.effort)};
-
-    const promptEl = document.getElementById("prompt");
-    const statusEl = document.getElementById("status");
-    const runMetaEl = document.getElementById("runMeta");
-    const planBtn = document.getElementById("planBtn");
-    const runBtn = document.getElementById("runBtn");
-    const stopBtn = document.getElementById("stopBtn");
-    const clearSessionBtn = document.getElementById("clearSessionBtn");
-    const reloadModelsBtn = document.getElementById("reloadModels");
-    const baseUrlInputEl = document.getElementById("baseUrlInput");
-    const modelSelectEl = document.getElementById("modelSelect");
-    const modelInfoEl = document.getElementById("modelInfo");
-    const thinkingToggleEl = document.getElementById("thinkingToggle");
-    const thinkingEffortEl = document.getElementById("thinkingEffort");
-    const planEl = document.getElementById("plan");
-    const progressBarEl = document.getElementById("progressBar");
-    const stepStatsEl = document.getElementById("stepStats");
-    const logsEl = document.getElementById("logs");
-    const historyEl = document.getElementById("history");
-    const activityEl = document.getElementById("activity");
-    const tokPromptEl = document.getElementById("tokPrompt");
-    const tokCompletionEl = document.getElementById("tokCompletion");
-    const tokTotalEl = document.getElementById("tokTotal");
-    const tokLastEl = document.getElementById("tokLast");
-
-    const state = {
-      running: false,
-      mode: "-",
-      model: "-",
-      thinkingEnabled: Boolean(bootThinkingEnabled),
-      thinkingEffort: String(bootThinkingEffort || "medium")
-    };
-    const streamNodes = new Map();
-
-    const applyResponsiveDensity = () => {
-      const width = Math.max(window.innerWidth || 0, document.documentElement ? document.documentElement.clientWidth : 0);
-      if (width <= 560) {
-        document.body.dataset.density = "compact";
-      } else if (width <= 960) {
-        document.body.dataset.density = "cozy";
-      } else {
-        document.body.dataset.density = "comfortable";
-      }
-    };
-
-    const post = (message) => {
-      try {
-        vscode.postMessage(message);
-      } catch {
-        // ignore post failures
-      }
-    };
-    const postTrace = (text) => post({ type: "client_trace", text });
-
-    post({ type: "webview_ready" });
-    postTrace("boot");
-    applyResponsiveDensity();
-    window.addEventListener("resize", applyResponsiveDensity);
-
-    window.addEventListener("error", (event) => {
-      const text = (event && event.message) ? String(event.message) : "Unknown script error.";
-      appendLog("UI error: " + text, "error");
-      post({ type: "client_error", text });
-    });
-
-    window.addEventListener("unhandledrejection", (event) => {
-      const reason = event && event.reason ? String(event.reason) : "Unknown promise rejection.";
-      appendLog("UI promise rejection: " + reason, "error");
-      post({ type: "client_error", text: reason });
-    });
-
-    const fmt = (n) => Number(n || 0).toLocaleString();
-
-    const appendLog = (text, cls = "") => {
-      if (!logsEl) {
-        post({ type: "client_error", text: "logs element not found" });
-        return;
-      }
-      const line = document.createElement("div");
-      if (cls) {
-        line.className = cls;
-      }
-      line.textContent = text;
-      logsEl.appendChild(line);
-      while (logsEl.childNodes.length > 500) {
-        logsEl.removeChild(logsEl.firstChild);
-      }
-      logsEl.scrollTop = logsEl.scrollHeight;
-    };
-
-    const updateStreamLog = (message) => {
-      if (!logsEl) {
-        return;
-      }
-      const key = String(message.streamId || "default");
-      let line = streamNodes.get(key);
-      if (line && !line.isConnected) {
-        streamNodes.delete(key);
-        line = undefined;
-      }
-      if (!line) {
-        line = document.createElement("div");
-        line.className = "hint mono";
-        line.dataset.streamId = key;
-        logsEl.appendChild(line);
-        streamNodes.set(key, line);
-      }
-
-      const header = "[stream " + (message.stepId || "-") + " t" + String(message.turn || 0) + "] ";
-      line.textContent = header + String(message.text || "");
-      if (message.done) {
-        line.className = "mono";
-        streamNodes.delete(key);
-      }
-      logsEl.scrollTop = logsEl.scrollHeight;
-    };
-
-    const appendActivity = (activity) => {
-      if (!activityEl) {
-        return;
-      }
-      const card = document.createElement("div");
-      card.className = "activity-card";
-
-      const head = document.createElement("div");
-      head.className = "activity-head";
-
-      const left = document.createElement("div");
-      left.className = "mono";
-      left.textContent = "[" + activity.stepId + " | t" + activity.turn + "] " + activity.actionType;
-
-      const badge = document.createElement("div");
-      badge.className = "badge " + (activity.status || "");
-      badge.textContent = activity.status;
-
-      head.appendChild(left);
-      head.appendChild(badge);
-
-      const detail = document.createElement("div");
-      detail.className = "mono";
-      detail.style.marginTop = "4px";
-      detail.textContent = activity.detail || "";
-
-      card.appendChild(head);
-      card.appendChild(detail);
-      activityEl.appendChild(card);
-
-      while (activityEl.childNodes.length > 180) {
-        activityEl.removeChild(activityEl.firstChild);
-      }
-      activityEl.scrollTop = activityEl.scrollHeight;
-    };
-
-    const renderHistory = (items) => {
-      if (!historyEl) {
-        return;
-      }
-      historyEl.innerHTML = "";
-
-      const rows = Array.isArray(items) ? items : [];
-      if (rows.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "hint";
-        empty.textContent = "No saved history yet.";
-        historyEl.appendChild(empty);
-        return;
-      }
-
-      for (const row of rows) {
-        const card = document.createElement("div");
-        card.className = "activity-card";
-
-        const top = document.createElement("div");
-        top.className = "history-row";
-
-        const meta = document.createElement("div");
-        meta.className = "history-meta";
-        meta.textContent =
-          "[" + row.mode + "] " + (row.model || "-") + " | " + (row.status || "-") + " | " + (row.timestamp || "-");
-
-        const useBtn = document.createElement("button");
-        useBtn.className = "history-btn";
-        useBtn.textContent = "Use Prompt";
-        useBtn.addEventListener("click", () => {
-          if (promptEl) {
-            promptEl.value = row.userPrompt || "";
-          }
-        });
-
-        top.appendChild(meta);
-        top.appendChild(useBtn);
-
-        const prompt = document.createElement("div");
-        prompt.className = "mono";
-        prompt.textContent = "Prompt: " + (row.userPrompt || "");
-
-        const summary = document.createElement("div");
-        summary.className = "mono";
-        summary.style.marginTop = "4px";
-        summary.textContent = "Summary: " + (row.preflightSummary || row.runSummary || "");
-
-        const learning = document.createElement("div");
-        learning.className = "mono";
-        learning.style.marginTop = "4px";
-        learning.textContent = "Learning: " + (row.learningNote || "(none)");
-
-        const remainingList = Array.isArray(row.remainingSteps) ? row.remainingSteps : [];
-        const remaining = document.createElement("div");
-        remaining.className = "mono";
-        remaining.style.marginTop = "4px";
-        if (remainingList.length > 0) {
-          remaining.textContent =
-            "Remaining: " +
-            remainingList
-              .slice(0, 4)
-              .map((step) => "[" + step.id + "] " + step.title + " (" + step.status + ")")
-              .join(" | ");
-        } else {
-          remaining.textContent = "Remaining: (none)";
-        }
-
-        card.appendChild(top);
-        card.appendChild(prompt);
-        card.appendChild(summary);
-        card.appendChild(learning);
-        card.appendChild(remaining);
-        historyEl.appendChild(card);
-      }
-    };
-
-    const normalizeThinkingEffortUi = (value) => {
-      const raw = String(value || "").trim().toLowerCase();
-      if (raw === "low" || raw === "high") {
-        return raw;
-      }
-      return "medium";
-    };
-
-    const syncThinkingControls = () => {
-      state.thinkingEffort = normalizeThinkingEffortUi(state.thinkingEffort);
-      if (thinkingToggleEl) {
-        thinkingToggleEl.checked = Boolean(state.thinkingEnabled);
-        thinkingToggleEl.disabled = Boolean(state.running);
-      }
-      if (thinkingEffortEl) {
-        thinkingEffortEl.value = state.thinkingEffort;
-        thinkingEffortEl.disabled = Boolean(state.running) || !Boolean(state.thinkingEnabled);
-      }
-    };
-
-    const refreshRunMeta = () => {
-      if (runMetaEl) {
-        const thinkingLabel = state.thinkingEnabled ? state.thinkingEffort : "off";
-        runMetaEl.textContent = "Mode: " + state.mode + " | Model: " + state.model + " | Thinking: " + thinkingLabel;
-      }
-    };
-
-    const clearForRun = () => {
-      if (activityEl) {
-        activityEl.innerHTML = "";
-      }
-      if (logsEl) {
-        logsEl.innerHTML = "";
-      }
-      streamNodes.clear();
-      if (tokPromptEl) {
-        tokPromptEl.textContent = "0";
-      }
-      if (tokCompletionEl) {
-        tokCompletionEl.textContent = "0";
-      }
-      if (tokTotalEl) {
-        tokTotalEl.textContent = "0";
-      }
-      if (tokLastEl) {
-        tokLastEl.textContent = "-";
-      }
-      if (statusEl) {
-        statusEl.textContent = "Starting...";
-      }
-    };
-
-    const clearSessionUi = () => {
-      if (activityEl) {
-        activityEl.innerHTML = "";
-      }
-      if (logsEl) {
-        logsEl.innerHTML = "";
-      }
-      streamNodes.clear();
-      if (planEl) {
-        planEl.innerHTML = "";
-      }
-      if (stepStatsEl) {
-        stepStatsEl.textContent = "0/0 done";
-      }
-      if (progressBarEl) {
-        progressBarEl.style.width = "0%";
-      }
-      if (tokPromptEl) {
-        tokPromptEl.textContent = "0";
-      }
-      if (tokCompletionEl) {
-        tokCompletionEl.textContent = "0";
-      }
-      if (tokTotalEl) {
-        tokTotalEl.textContent = "0";
-      }
-      if (tokLastEl) {
-        tokLastEl.textContent = "-";
-      }
-      if (promptEl) {
-        promptEl.value = "";
-      }
-      state.mode = "-";
-      state.model = modelSelectEl ? (modelSelectEl.value || "-") : "-";
-      refreshRunMeta();
-      if (statusEl) {
-        statusEl.textContent = "Idle";
-      }
-    };
-
-    const updatePlanProgress = () => {
-      if (!planEl) {
-        return;
-      }
-      const nodes = Array.from(planEl.querySelectorAll("li"));
-      const total = nodes.length;
-      let done = 0;
-      nodes.forEach((node) => {
-        if (node.dataset.status === "done") {
-          done += 1;
-        }
-      });
-
-      if (stepStatsEl) {
-        stepStatsEl.textContent = done + "/" + total + " done";
-      }
-      const percent = total > 0 ? Math.round((done * 100) / total) : 0;
-      if (progressBarEl) {
-        progressBarEl.style.width = String(percent) + "%";
-      }
-    };
-
-    const renderPlan = (plan) => {
-      if (!planEl) {
-        return;
-      }
-      planEl.innerHTML = "";
-      if (!plan || !Array.isArray(plan.steps)) {
-        updatePlanProgress();
-        return;
-      }
-
-      for (const step of plan.steps) {
-        const li = document.createElement("li");
-        li.className = "item";
-        li.dataset.stepId = step.id;
-        li.dataset.status = step.status || "pending";
-        li.textContent = "[" + step.id + "] " + step.title + " (" + li.dataset.status + ")\\n" + (step.details || "");
-        planEl.appendChild(li);
-      }
-
-      updatePlanProgress();
-    };
-
-    const updateStepStatus = (stepId, status) => {
-      if (!planEl) {
-        return;
-      }
-      const node = planEl.querySelector('li[data-step-id="' + stepId + '"]');
-      if (!node) {
-        return;
-      }
-      node.dataset.status = status;
-      const text = node.textContent || "";
-      node.textContent = text.replace(/\\((pending|in_progress|done|failed)\\)/, "(" + status + ")");
-      updatePlanProgress();
-    };
-
-    const normalizeModelItems = (payload) => {
-      const out = [];
-
-      if (Array.isArray(payload.items)) {
-        for (const item of payload.items) {
-          if (typeof item === "string" && item.trim()) {
-            out.push(item.trim());
-          } else if (item && typeof item === "object" && typeof item.id === "string" && item.id.trim()) {
-            out.push(item.id.trim());
-          }
-        }
-      } else if (payload.items && typeof payload.items === "string") {
-        try {
-          const parsed = JSON.parse(payload.items);
-          if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (typeof item === "string" && item.trim()) {
-                out.push(item.trim());
-              }
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      if (out.length === 0 && payload.data && Array.isArray(payload.data)) {
-        for (const row of payload.data) {
-          if (row && typeof row === "object" && typeof row.id === "string" && row.id.trim()) {
-            out.push(row.id.trim());
-          }
-        }
-      }
-
-      return Array.from(new Set(out));
-    };
-
-    const updateModels = (payload) => {
-      if (!modelSelectEl) {
-        appendLog("Model UI error: modelSelect element not found.", "error");
-        return;
-      }
-      if (modelSelectEl.tagName !== "SELECT") {
-        appendLog("Model UI error: modelSelect is not a <select> element.", "error");
-        return;
-      }
-
-      const previous = modelSelectEl.value;
-      while (modelSelectEl.options.length > 0) {
-        modelSelectEl.remove(0);
-      }
-
-      const models = normalizeModelItems(payload);
-      const modelList = models.length > 0 ? models : [""];
-      for (const model of modelList) {
-        const label = model || "(No models)";
-        const option = document.createElement("option");
-        option.value = model;
-        option.textContent = label;
-        modelSelectEl.add(option);
-      }
-
-      if (models.length === 0) {
-        modelSelectEl.selectedIndex = 0;
-      }
-
-      const selected = payload.selected || previous || (models[0] || "");
-      if (selected && models.includes(selected)) {
-        modelSelectEl.value = selected;
-      } else if (models.length > 0) {
-        modelSelectEl.selectedIndex = 0;
-      }
-
-      state.model = modelSelectEl.value || "-";
-      refreshRunMeta();
-
-      if (baseUrlInputEl && payload.baseUrl && typeof payload.baseUrl === "string") {
-        baseUrlInputEl.value = payload.baseUrl;
-      }
-
-      if (modelInfoEl) {
-        if (payload.error) {
-          modelInfoEl.textContent = payload.error;
-          modelInfoEl.className = "hint error";
-        } else {
-          modelInfoEl.textContent = payload.info || "";
-          modelInfoEl.className = "hint";
-        }
-      }
-
-      appendLog(
-        payload.error
-          ? "Model load failed at URL " + (payload.baseUrl || "-")
-          : "Model load success: " + String(models.length) + " model(s) from " + (payload.baseUrl || "-"),
-        payload.error ? "error" : ""
-      );
-    };
-
-    const requestModels = () => {
-      try {
-        const preferredModel = modelSelectEl ? (modelSelectEl.value || "") : "";
-        const baseUrl = String((baseUrlInputEl && baseUrlInputEl.value) || "");
-        postTrace("load_models clicked: " + (baseUrl || "(empty)"));
-        post({
-          type: "load_models",
-          preferredModel,
-          baseUrl
-        });
-        appendLog("Requesting models from URL: " + (baseUrl || "(empty -> fallback config)"));
-      } catch (error) {
-        const text = error instanceof Error ? error.message : String(error);
-        post({ type: "client_error", text: "requestModels failed: " + text });
-      }
-    };
-
-    window.requestModels = requestModels;
-
-    if (planBtn) {
-      planBtn.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const prompt = String((promptEl && promptEl.value) || "");
-        const model = String((modelSelectEl && modelSelectEl.value) || "");
-        const baseUrl = String((baseUrlInputEl && baseUrlInputEl.value) || "");
-        const thinkingEnabled = Boolean(thinkingToggleEl && thinkingToggleEl.checked);
-        const thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl ? thinkingEffortEl.value : state.thinkingEffort);
-        state.thinkingEnabled = thinkingEnabled;
-        state.thinkingEffort = thinkingEffort;
-        syncThinkingControls();
-        refreshRunMeta();
-        postTrace(
-          "run clicked: mode=plan model=" +
-            (model || "(empty)") +
-            " baseUrl=" +
-            (baseUrl || "(empty)") +
-            " thinking=" +
-            (thinkingEnabled ? thinkingEffort : "off")
-        );
-        clearForRun();
-        post({ type: "run", mode: "plan", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
-      });
-    }
-
-    if (runBtn) {
-      runBtn.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const prompt = String((promptEl && promptEl.value) || "");
-        const model = String((modelSelectEl && modelSelectEl.value) || "");
-        const baseUrl = String((baseUrlInputEl && baseUrlInputEl.value) || "");
-        const thinkingEnabled = Boolean(thinkingToggleEl && thinkingToggleEl.checked);
-        const thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl ? thinkingEffortEl.value : state.thinkingEffort);
-        state.thinkingEnabled = thinkingEnabled;
-        state.thinkingEffort = thinkingEffort;
-        syncThinkingControls();
-        refreshRunMeta();
-        postTrace(
-          "run clicked: mode=agent model=" +
-            (model || "(empty)") +
-            " baseUrl=" +
-            (baseUrl || "(empty)") +
-            " thinking=" +
-            (thinkingEnabled ? thinkingEffort : "off")
-        );
-        clearForRun();
-        post({ type: "run", mode: "agent", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
-      });
-    }
-
-    if (stopBtn) {
-      stopBtn.addEventListener("click", () => {
-        post({ type: "stop" });
-      });
-    }
-
-    if (clearSessionBtn) {
-      clearSessionBtn.addEventListener("click", () => {
-        if (state.running) {
-          appendLog("Stop current run before clearing session.", "error");
-          return;
-        }
-        post({ type: "clear_session" });
-      });
-    }
-
-    if (reloadModelsBtn) {
-      reloadModelsBtn.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        requestModels();
-      });
-    }
-
-    if (thinkingToggleEl) {
-      thinkingToggleEl.addEventListener("change", () => {
-        state.thinkingEnabled = Boolean(thinkingToggleEl.checked);
-        syncThinkingControls();
-        refreshRunMeta();
-      });
-    }
-
-    if (thinkingEffortEl) {
-      thinkingEffortEl.addEventListener("change", () => {
-        state.thinkingEffort = normalizeThinkingEffortUi(thinkingEffortEl.value);
-        syncThinkingControls();
-        refreshRunMeta();
-      });
-    }
-
-    if (baseUrlInputEl) {
-      baseUrlInputEl.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          requestModels();
-        }
-      });
-    }
-
-    if (modelSelectEl) {
-      modelSelectEl.addEventListener("change", () => {
-        state.model = modelSelectEl.value || "-";
-        refreshRunMeta();
-      });
-    }
-
-    window.addEventListener("message", (event) => {
-      const message = event.data;
-      switch (message.type) {
-        case "status":
-          if (statusEl) {
-            statusEl.textContent = message.text;
-          }
-          break;
-
-        case "run_context":
-          state.mode = message.mode;
-          state.model = message.model || "-";
-          refreshRunMeta();
-          break;
-
-        case "running": {
-          const disabled = Boolean(message.value);
-          state.running = disabled;
-          if (planBtn) {
-            planBtn.disabled = disabled;
-          }
-          if (runBtn) {
-            runBtn.disabled = disabled;
-          }
-          if (clearSessionBtn) {
-            clearSessionBtn.disabled = disabled;
-          }
-          if (reloadModelsBtn) {
-            reloadModelsBtn.disabled = disabled;
-          }
-          if (baseUrlInputEl) {
-            baseUrlInputEl.disabled = disabled;
-          }
-          if (modelSelectEl) {
-            modelSelectEl.disabled = disabled;
-          }
-          syncThinkingControls();
-          break;
-        }
-
-        case "models":
-          try {
-            updateModels(message);
-          } catch (error) {
-            const text = error instanceof Error ? error.message : String(error);
-            appendLog("Model UI render failed: " + text, "error");
-            post({ type: "client_error", text: "updateModels failed: " + text });
-          }
-          break;
-
-        case "usage_reset":
-          if (tokPromptEl) {
-            tokPromptEl.textContent = "0";
-          }
-          if (tokCompletionEl) {
-            tokCompletionEl.textContent = "0";
-          }
-          if (tokTotalEl) {
-            tokTotalEl.textContent = "0";
-          }
-          if (tokLastEl) {
-            tokLastEl.textContent = "-";
-          }
-          break;
-
-        case "usage": {
-          if (tokPromptEl) {
-            tokPromptEl.textContent = fmt(message.cumulativePrompt);
-          }
-          if (tokCompletionEl) {
-            tokCompletionEl.textContent = fmt(message.cumulativeCompletion);
-          }
-          if (tokTotalEl) {
-            tokTotalEl.textContent = fmt(message.cumulativeTotal);
-          }
-
-          const callText =
-            message.phase + " " +
-            "p:" + fmt(message.promptTokens) +
-            " c:" + fmt(message.completionTokens) +
-            " t:" + fmt(message.totalTokens);
-          if (tokLastEl) {
-            tokLastEl.textContent = callText;
-          }
-          break;
-        }
-
-        case "history":
-          renderHistory(message.items);
-          break;
-
-        case "activity":
-          appendActivity(message);
-          break;
-
-        case "stream":
-          updateStreamLog(message);
-          break;
-
-        case "log":
-          appendLog(message.text);
-          break;
-
-        case "plan":
-          renderPlan(message.plan);
-          appendLog("Plan: " + (message.plan.summary || ""));
-          break;
-
-        case "step":
-          updateStepStatus(message.stepId, message.status);
-          appendLog("Step " + message.stepId + " -> " + message.status);
-          break;
-
-        case "done":
-          appendLog(message.text, "done");
-          if (statusEl) {
-            statusEl.textContent = "Done";
-          }
-          break;
-
-        case "error":
-          appendLog(message.text, "error");
-          if (statusEl) {
-            statusEl.textContent = "Error";
-          }
-          break;
-
-        case "session_cleared":
-          clearSessionUi();
-          appendLog("Session cleared. New request will start fresh.");
-          break;
-
-        default:
-          break;
-      }
-    });
-
-    syncThinkingControls();
-    refreshRunMeta();
-    postTrace("boot-complete");
-    requestModels();
-    post({ type: "load_history" });
-  </script>
-</body>
-</html>`;
+    return buildWebviewHtml(this.readThinkingSettings(), this.modelBootstrap);
   }
-}
-
-function createNonce(length = 32): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let output = "";
-  for (let i = 0; i < length; i += 1) {
-    output += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return output;
 }

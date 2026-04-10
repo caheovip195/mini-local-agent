@@ -26,6 +26,7 @@ export interface AgentDecision {
 export interface AgentConfig {
   workspaceRoot: string;
   preferredLanguage: string;
+  guardMode: "strict" | "balanced" | "relaxed";
   thinkingEnabled: boolean;
   thinkingEffort: "low" | "medium" | "high";
   strictResponsibilityMode: boolean;
@@ -36,6 +37,7 @@ export interface AgentConfig {
   strategyCandidates: number;
   commandTimeoutMs: number;
   autoApplyWrites: boolean;
+  systemPromptMode: "strict" | "provider_first";
   extraSystemPrompt: string;
 }
 

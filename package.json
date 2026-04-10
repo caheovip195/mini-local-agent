@@ -2,7 +2,7 @@
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
   "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.51",
+  "version": "0.0.102",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -15,7 +15,7 @@
     "onView:localAgent.chatView",
     "onCommand:localAgent.runTask",
     "onCommand:localAgent.planTask",
-    "onCommand:localAgent.setupOpenRouterSimple"
+    "onCommand:localAgent.reloadModels"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -47,8 +47,8 @@
         "title": "Local Agent: Create Plan Only"
       },
       {
-        "command": "localAgent.setupOpenRouterSimple",
-        "title": "Local Agent: Setup OpenRouter (Simple)"
+        "command": "localAgent.reloadModels",
+        "title": "Local Agent: Reload Models"
       }
     ],
     "configuration": {
@@ -61,44 +61,31 @@
         },
         "localAgent.lmStudio.apiKey": {
           "type": "string",
-          "default": "lm-studio",
-          "description": "API key for LM Studio endpoint (LM Studio can accept any placeholder)."
+          "default": "",
+          "description": "API key for LM Studio endpoint. Leave empty only when LM Studio auth is disabled."
         },
         "localAgent.lmStudio.model": {
           "type": "string",
           "default": "qwen2.5-coder-7b-instruct",
           "description": "Model name loaded in LM Studio."
         },
-        "localAgent.openRouter.simpleMode": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable simple OpenRouter config (only API key + model). When enabled, provider is forced to OpenRouter."
-        },
-        "localAgent.openRouter.apiKey": {
+        "localAgent.lmStudio.preset": {
           "type": "string",
           "default": "",
-          "description": "OpenRouter API key for simple mode."
+          "description": "Optional LM Studio preset name to attach to API requests."
         },
-        "localAgent.openRouter.model": {
-          "type": "string",
-          "default": "openrouter/auto",
-          "description": "OpenRouter model for simple mode."
-        },
-        "localAgent.openRouter.siteUrl": {
-          "type": "string",
-          "default": "",
-          "description": "Optional HTTP-Referer for OpenRouter simple mode."
-        },
-        "localAgent.openRouter.appName": {
-          "type": "string",
-          "default": "Local Agent Coder",
-          "description": "Optional X-Title for OpenRouter simple mode."
+        "localAgent.lmStudio.integrations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Optional LM Studio MCP integration IDs for native chat endpoint. Example: [\"mcp/duckduckgo\",\"mcp/web-search\",\"mcp/context7\"]. Empty = auto-discover from ~/.lmstudio/mcp.json."
         },
         "localAgent.provider.preset": {
           "type": "string",
           "enum": [
             "lmstudio",
-            "openrouter",
             "custom"
           ],
           "default": "lmstudio",
@@ -107,17 +94,27 @@
         "localAgent.provider.baseUrl": {
           "type": "string",
           "default": "",
-          "description": "Override base URL for provider preset (for example https://openrouter.ai/api/v1 or other OpenAI-compatible endpoints)."
+          "description": "Override base URL for provider preset."
         },
         "localAgent.provider.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Override API key for provider preset. Leave empty to reuse localAgent.lmStudio.apiKey."
+          "description": "Optional provider API key. If set, extension will prefer this key for both provider presets."
         },
         "localAgent.provider.model": {
           "type": "string",
           "default": "",
           "description": "Override model name for provider preset. Leave empty to reuse localAgent.lmStudio.model."
+        },
+        "localAgent.provider.apiMode": {
+          "type": "string",
+          "enum": [
+            "chat_completions",
+            "responses",
+            "lm_rest_chat"
+          ],
+          "default": "lm_rest_chat",
+          "description": "Endpoint mode. chat_completions/responses are OpenAI-compatible. lm_rest_chat uses LM Studio native /api/v1/chat (required for local mcp.json integrations)."
         },
         "localAgent.provider.modelsPath": {
           "type": "string",
@@ -134,15 +131,15 @@
           "default": "{}",
           "description": "Extra HTTP headers as JSON object string. Example: {\"X-Key\":\"value\"}"
         },
-        "localAgent.provider.openRouterSiteUrl": {
+        "localAgent.provider.extraBody": {
+          "type": "string",
+          "default": "{}",
+          "description": "Extra chat body JSON merged into each request (except protected keys like model/messages/stream). Example: {\"preset\":\"my-preset\"}"
+        },
+        "localAgent.provider.presetName": {
           "type": "string",
           "default": "",
-          "description": "Optional HTTP-Referer sent when using OpenRouter preset."
-        },
-        "localAgent.provider.openRouterAppName": {
-          "type": "string",
-          "default": "Local Agent Coder",
-          "description": "Optional X-Title sent when using OpenRouter preset."
+          "description": "Optional provider preset name. If set and extraBody has no preset, request body will include {\"preset\":\"...\"}."
         },
         "localAgent.inline.enabled": {
           "type": "boolean",
@@ -238,9 +235,28 @@
           "maximum": 30,
           "description": "Maximum agent turns per plan step."
         },
+        "localAgent.guardMode": {
+          "type": "string",
+          "enum": [
+            "strict",
+            "balanced",
+            "relaxed"
+          ],
+          "default": "relaxed",
+          "description": "How strict runtime guards are. relaxed = fewer blocks and more exploration freedom."
+        },
+        "localAgent.systemPromptMode": {
+          "type": "string",
+          "enum": [
+            "strict",
+            "provider_first"
+          ],
+          "default": "strict",
+          "description": "strict = extension prompt rules dominate. provider_first = lighter built-in prompts so provider preset/system prompt can lead more."
+        },
         "localAgent.strictResponsibilityMode": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Run an internal responsibility review before execute actions (write/run/complete/final) to block off-scope behavior."
         },
         "localAgent.executorMaxTokens": {
@@ -252,14 +268,14 @@
         },
         "localAgent.maxAskUser": {
           "type": "number",
-          "default": 0,
+          "default": 1,
           "minimum": 0,
           "maximum": 3,
           "description": "Maximum times the agent can ask the user in one task."
         },
         "localAgent.minInvestigationsBeforeExecute": {
           "type": "number",
-          "default": 3,
+          "default": 1,
           "minimum": 1,
           "maximum": 6,
           "description": "Minimum list/search/read actions before write/run/complete to reduce blind edits."
@@ -294,11 +310,11 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "package": "npx @vscode/vsce package"
   },
   "devDependencies": {
-    "@types/node": "^20.12.7",
+    "@types/node": "^25.5.2",
     "@types/vscode": "^1.87.0",
-    "typescript": "^5.4.5"
+    "typescript": "^6.0.2"
   }
 }
