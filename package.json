@@ -1,8 +1,8 @@
 {
   "name": "local-agent-coder",
   "displayName": "Local Agent Coder",
-  "description": "Agent + Plan coding assistant for local LM Studio models.",
-  "version": "0.0.102",
+  "description": "Agent + Plan coding assistant for LM Studio, OpenRouter, and OpenAI-compatible APIs.",
+  "version": "0.0.106",
   "publisher": "local",
   "engines": {
     "vscode": "^1.87.0"
@@ -82,14 +82,45 @@
           "default": [],
           "description": "Optional LM Studio MCP integration IDs for native chat endpoint. Example: [\"mcp/duckduckgo\",\"mcp/web-search\",\"mcp/context7\"]. Empty = auto-discover from ~/.lmstudio/mcp.json."
         },
+        "localAgent.openRouter.baseUrl": {
+          "type": "string",
+          "default": "https://openrouter.ai/api/v1",
+          "description": "OpenRouter base URL."
+        },
+        "localAgent.openRouter.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter API key (starts with sk-or-v1-...)."
+        },
+        "localAgent.openRouter.model": {
+          "type": "string",
+          "default": "",
+          "description": "Default OpenRouter model ID. Empty uses localAgent.provider.model or localAgent.lmStudio.model."
+        },
+        "localAgent.openRouter.presetName": {
+          "type": "string",
+          "default": "",
+          "description": "Optional preset name sent as request body field {\"preset\":\"...\"} for OpenRouter."
+        },
+        "localAgent.openRouter.siteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional HTTP-Referer header for OpenRouter."
+        },
+        "localAgent.openRouter.appName": {
+          "type": "string",
+          "default": "Local Agent Coder",
+          "description": "Optional X-Title header for OpenRouter."
+        },
         "localAgent.provider.preset": {
           "type": "string",
           "enum": [
             "lmstudio",
+            "openrouter",
             "custom"
           ],
           "default": "lmstudio",
-          "description": "Backend provider preset. 'custom' works with any OpenAI-compatible API."
+          "description": "Backend provider preset. 'openrouter' uses localAgent.openRouter.* settings. 'custom' works with any OpenAI-compatible API."
         },
         "localAgent.provider.baseUrl": {
           "type": "string",
@@ -302,7 +333,12 @@
         "localAgent.systemPromptExtra": {
           "type": "string",
           "default": "",
-          "description": "Additional system prompt content appended to planner and agent prompts."
+          "description": "Legacy alias for custom system prompt. Prefer localAgent.systemPrompt."
+        },
+        "localAgent.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Custom system prompt applied to Chat + Planner + Agent executor in this workspace."
         }
       }
     }

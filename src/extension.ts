@@ -95,12 +95,12 @@ type WebviewEvent =
   | { type: "session_cleared" };
 
 interface LmSettings {
-  providerPreset: "lmstudio" | "custom";
+  providerPreset: "lmstudio" | "openrouter" | "custom";
   apiMode: "chat_completions" | "responses" | "lm_rest_chat";
   providerName: string;
   baseUrl: string;
   apiKey: string;
-  apiKeySource: "lmStudio.apiKey" | "provider.apiKey" | "none";
+  apiKeySource: "lmStudio.apiKey" | "openRouter.apiKey" | "provider.apiKey" | "none";
   model: string;
   modelsPath: string;
   chatPath: string;
@@ -171,6 +171,7 @@ const HISTORY_LIMIT = 40;
 const LEARNING_LIMIT = 60;
 const CHAT_TURN_LIMIT = 80;
 const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Local Agent Coder");
@@ -289,13 +290,15 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           const mode = payload.mode === "plan" ? "plan" : payload.mode === "chat" ? "chat" : "agent";
           const model = typeof payload.model === "string" ? payload.model.trim() : "";
           const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl.trim() : "";
+          const systemPromptRaw = typeof payload.systemPrompt === "string" ? payload.systemPrompt : undefined;
+          const systemPrompt = typeof systemPromptRaw === "string" ? this.normalizeSystemPromptValue(systemPromptRaw) : undefined;
           const thinkingEnabled =
             typeof payload.thinkingEnabled === "boolean" ? payload.thinkingEnabled : undefined;
           const thinkingEffortRaw = typeof payload.thinkingEffort === "string" ? payload.thinkingEffort : undefined;
           const thinkingEffort = thinkingEffortRaw ? this.normalizeThinkingEffort(thinkingEffortRaw) : undefined;
 
           this.output.appendLine(
-            `run request mode=${mode} model=${model || "-"} baseUrl=${baseUrl || "-"} thinking=${thinkingEnabled === true ? thinkingEffort || "medium" : "off"} promptChars=${prompt.length}`
+            `run request mode=${mode} model=${model || "-"} baseUrl=${baseUrl || "-"} thinking=${thinkingEnabled === true ? thinkingEffort || "medium" : "off"} promptChars=${prompt.length} systemPromptChars=${systemPrompt ? systemPrompt.length : 0}`
           );
 
           if (!prompt) {
@@ -303,7 +306,25 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
             return;
           }
 
-          await this.run(prompt, { type: mode }, model, baseUrl, thinkingEnabled, thinkingEffort);
+          if (typeof systemPrompt === "string") {
+            await this.persistSystemPrompt(systemPrompt);
+          }
+          await this.run(prompt, { type: mode }, model, baseUrl, thinkingEnabled, thinkingEffort, systemPrompt);
+          return;
+        }
+
+        case "save_system_prompt": {
+          const systemPromptRaw = typeof payload.text === "string" ? payload.text : "";
+          const systemPrompt = this.normalizeSystemPromptValue(systemPromptRaw);
+          await this.persistSystemPrompt(systemPrompt);
+          this.output.appendLine(`system prompt saved chars=${systemPrompt.length}`);
+          this.post({
+            type: "log",
+            text:
+              systemPrompt.length > 0
+                ? `System prompt saved (${systemPrompt.length} chars).`
+                : "System prompt cleared."
+          });
           return;
         }
 
@@ -382,7 +403,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     modelOverride?: string,
     baseUrlOverride?: string,
     thinkingEnabledOverride?: boolean,
-    thinkingEffortOverride?: ThinkingEffort
+    thinkingEffortOverride?: ThinkingEffort,
+    systemPromptOverride?: string
   ): Promise<void> {
     if (this.running) {
       this.post({ type: "error", text: "Another task is already running." });
@@ -415,8 +437,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       {
         enabled: selectedThinkingEnabled,
         effort: selectedThinkingEffort
-      }
+      },
+      systemPromptOverride
     );
+    const selectedSystemPrompt = config.agentConfig.extraSystemPrompt;
 
     await this.persistLmSelection(selectedModel, selectedBaseUrl);
     await this.persistThinkingSelection(selectedThinkingEnabled, selectedThinkingEffort);
@@ -444,6 +468,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       });
     }
     this.output.appendLine(`Thinking=${selectedThinkingEnabled ? selectedThinkingEffort : "off"}`);
+    this.output.appendLine(`SystemPrompt chars=${selectedSystemPrompt.length}`);
     this.output.appendLine(`Prompt: ${prompt}`);
 
     this.running = true;
@@ -645,8 +670,9 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
           this.post({ type: "thinking", text: trimmed.slice(-6000) });
         };
         const messages: ChatMessage[] = [
+          ...(selectedSystemPrompt.length > 0 ? [{ role: "system" as const, content: selectedSystemPrompt }] : []),
           { role: "system", content: chatGuardPrompt },
-          ...this.chatSession,
+          ...this.chatSession
         ];
         const response = await client.chat(messages, this.abortController.signal, {
           temperature: 0.25,
@@ -1554,16 +1580,23 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
 
   private async persistLmSelection(model: string, baseUrl: string): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("localAgent");
+    const current = this.readLmSettings();
     const updates: Array<Thenable<unknown>> = [];
 
     if (model.trim()) {
       updates.push(cfg.update("lmStudio.model", model, vscode.ConfigurationTarget.Workspace));
       updates.push(cfg.update("provider.model", model, vscode.ConfigurationTarget.Workspace));
+      if (current.providerPreset === "openrouter") {
+        updates.push(cfg.update("openRouter.model", model, vscode.ConfigurationTarget.Workspace));
+      }
     }
 
     if (baseUrl.trim()) {
       updates.push(cfg.update("lmStudio.baseUrl", baseUrl, vscode.ConfigurationTarget.Workspace));
       updates.push(cfg.update("provider.baseUrl", baseUrl, vscode.ConfigurationTarget.Workspace));
+      if (current.providerPreset === "openrouter") {
+        updates.push(cfg.update("openRouter.baseUrl", baseUrl, vscode.ConfigurationTarget.Workspace));
+      }
     }
 
     if (updates.length === 0) {
@@ -1587,6 +1620,37 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     } catch {
       // Ignore config update errors and continue run.
     }
+  }
+
+  private async persistSystemPrompt(systemPrompt: string): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    const normalized = this.normalizeSystemPromptValue(systemPrompt);
+    try {
+      await Promise.all([
+        cfg.update("systemPrompt", normalized, vscode.ConfigurationTarget.Workspace),
+        cfg.update("systemPromptExtra", normalized, vscode.ConfigurationTarget.Workspace)
+      ]);
+    } catch {
+      // Ignore config update errors and continue run.
+    }
+  }
+
+  private readCustomSystemPrompt(): string {
+    const cfg = vscode.workspace.getConfiguration("localAgent");
+    const primary = this.normalizeSystemPromptValue(cfg.get<string>("systemPrompt", ""));
+    if (primary.length > 0) {
+      return primary;
+    }
+    return this.normalizeSystemPromptValue(cfg.get<string>("systemPromptExtra", ""));
+  }
+
+  private normalizeSystemPromptValue(value: string): string {
+    const normalized = String(value || "").replace(/\r\n/g, "\n").trim();
+    const maxChars = 20000;
+    if (normalized.length <= maxChars) {
+      return normalized;
+    }
+    return normalized.slice(0, maxChars).trim();
   }
 
   private async loadModels(preferredModel?: string, baseUrlOverride?: string): Promise<void> {
@@ -1778,7 +1842,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const legacyModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
 
     const rawPreset = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const configuredPreset: LmSettings["providerPreset"] = rawPreset === "custom" ? "custom" : "lmstudio";
+    const configuredPreset: LmSettings["providerPreset"] =
+      rawPreset === "custom" ? "custom" : rawPreset === "openrouter" ? "openrouter" : "lmstudio";
     const providerPreset: LmSettings["providerPreset"] = configuredPreset;
     const apiModeInspect = cfg.inspect<string>("provider.apiMode");
     const hasUserApiModeOverride =
@@ -1792,12 +1857,18 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         : rawApiMode === "lm_rest_chat"
           ? "lm_rest_chat"
           : "responses";
-    if (configuredPreset === "lmstudio" && !hasUserApiModeOverride) {
-      apiMode = "lm_rest_chat";
+    if (!hasUserApiModeOverride) {
+      apiMode = configuredPreset === "lmstudio" ? "lm_rest_chat" : "chat_completions";
     }
     const configuredPresetName = cfg.get<string>("provider.presetName", "").trim();
     const legacyLmPreset = cfg.get<string>("lmStudio.preset", "").trim();
-    const presetName = configuredPresetName || legacyLmPreset;
+    const presetName = configuredPreset === "lmstudio" ? configuredPresetName || legacyLmPreset : configuredPresetName;
+    const openRouterBaseUrl = cfg.get<string>("openRouter.baseUrl", DEFAULT_OPENROUTER_BASE_URL).trim();
+    const openRouterApiKey = this.normalizeApiKey(cfg.get<string>("openRouter.apiKey", ""));
+    const openRouterModel = cfg.get<string>("openRouter.model", "").trim();
+    const openRouterPresetName = cfg.get<string>("openRouter.presetName", "").trim();
+    const openRouterSiteUrl = cfg.get<string>("openRouter.siteUrl", "").trim();
+    const openRouterAppName = cfg.get<string>("openRouter.appName", "Local Agent Coder").trim();
 
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
     const providerApiKey = this.normalizeApiKey(cfg.get<string>("provider.apiKey", ""));
@@ -1814,8 +1885,23 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     const lmStudioIntegrations = this.normalizeIntegrationIds(cfg.get<string[]>("lmStudio.integrations", []));
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
     const extraBody = this.parseBodyJson(cfg.get<string>("provider.extraBody", "{}"));
-    if (presetName.length > 0 && !Object.prototype.hasOwnProperty.call(extraBody, "preset")) {
-      extraBody.preset = presetName;
+    const effectivePresetName = providerPreset === "openrouter" ? openRouterPresetName || configuredPresetName : presetName;
+    if (effectivePresetName.length > 0 && !Object.prototype.hasOwnProperty.call(extraBody, "preset")) {
+      extraBody.preset = effectivePresetName;
+    }
+    if (
+      providerPreset === "openrouter" &&
+      Object.prototype.hasOwnProperty.call(extraBody, "preset") &&
+      typeof extraBody.preset !== "string"
+    ) {
+      delete extraBody.preset;
+    }
+    if (
+      providerPreset === "openrouter" &&
+      typeof extraBody.preset === "string" &&
+      extraBody.preset.trim().length === 0
+    ) {
+      delete extraBody.preset;
     }
 
     let baseUrl = legacyBaseUrl;
@@ -1835,8 +1921,29 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       modelsPath = providerModelsPath;
       chatPath = providerChatPath;
       headers = { ...extraHeaders };
+    } else if (providerPreset === "openrouter") {
+      baseUrl = openRouterBaseUrl.length > 0 ? openRouterBaseUrl : providerBaseUrl || DEFAULT_OPENROUTER_BASE_URL;
+      apiKey =
+        openRouterApiKey.length > 0 ? openRouterApiKey : providerApiKey.length > 0 ? providerApiKey : legacyApiKey;
+      apiKeySource =
+        openRouterApiKey.length > 0
+          ? "openRouter.apiKey"
+          : providerApiKey.length > 0
+            ? "provider.apiKey"
+            : legacyApiKey.length > 0
+              ? "lmStudio.apiKey"
+              : "none";
+      model = providerModel.length > 0 ? providerModel : openRouterModel.length > 0 ? openRouterModel : legacyModel;
+      modelsPath = providerModelsPath;
+      chatPath = providerChatPath;
+      headers = {
+        ...(openRouterSiteUrl.length > 0 ? { "HTTP-Referer": openRouterSiteUrl } : {}),
+        ...(openRouterAppName.length > 0 ? { "X-Title": openRouterAppName } : {}),
+        ...extraHeaders
+      };
     }
-    const providerName = providerPreset === "custom" ? "Custom API" : "LM Studio";
+    const providerName =
+      providerPreset === "custom" ? "Custom API" : providerPreset === "openrouter" ? "OpenRouter" : "LM Studio";
 
     return {
       providerPreset,
@@ -1848,7 +1955,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
       model,
       modelsPath,
       chatPath,
-      presetName,
+      presetName: effectivePresetName,
       headers,
       extraBody,
       lmStudioIntegrations
@@ -1874,7 +1981,8 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
     workspaceRoot: string,
     lm: LmSettings,
     preferredLanguage: string,
-    thinking?: ThinkingSettings
+    thinking?: ThinkingSettings,
+    systemPromptOverride?: string
   ): {
     providerName: string;
     baseUrl: string;
@@ -1888,6 +1996,10 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   } {
     const cfg = vscode.workspace.getConfiguration("localAgent");
     const thinkingSettings = thinking ?? this.readThinkingSettings();
+    const customSystemPrompt =
+      typeof systemPromptOverride === "string"
+        ? this.normalizeSystemPromptValue(systemPromptOverride)
+        : this.readCustomSystemPrompt();
 
     return {
       providerName: lm.providerName,
@@ -1913,7 +2025,7 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
         strategyCandidates: cfg.get<number>("strategyCandidates", 3),
         commandTimeoutMs: cfg.get<number>("commandTimeoutMs", 120000),
         autoApplyWrites: cfg.get<boolean>("autoApplyWrites", true),
-        extraSystemPrompt: cfg.get<string>("systemPromptExtra", "")
+        extraSystemPrompt: customSystemPrompt
       }
     };
   }
@@ -2068,6 +2180,6 @@ class LocalAgentViewProvider implements vscode.WebviewViewProvider {
   }
 
   private getHtml(): string {
-    return buildWebviewHtml(this.readThinkingSettings(), this.modelBootstrap);
+    return buildWebviewHtml(this.readThinkingSettings(), this.modelBootstrap, this.readCustomSystemPrompt());
   }
 }

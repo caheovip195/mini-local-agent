@@ -19,18 +19,26 @@ npm run compile
 
 Mo thu muc nay trong VSCode, sau do nhan `F5` de chay Extension Development Host.
 
-## 2) Cau hinh LM Studio
+## 2) Cau hinh LM Studio / OpenRouter
 
 Vao VSCode Settings, tim `localAgent`:
 
 - `localAgent.lmStudio.baseUrl`: mac dinh `http://127.0.0.1:1234/v1`
 - `localAgent.lmStudio.apiKey`: mac dinh rong (`""`), phai dat token neu bat auth trong LM Studio
 - `localAgent.lmStudio.model`: ten model dang load trong LM Studio
+- `localAgent.provider.preset`: `lmstudio` | `openrouter` | `custom`
+- Neu dung OpenRouter:
+  - `localAgent.provider.preset = openrouter`
+  - `localAgent.openRouter.apiKey = <your-openrouter-key>`
+  - `localAgent.openRouter.baseUrl = https://openrouter.ai/api/v1`
+  - `localAgent.openRouter.model = <model-id>` (vd `openai/gpt-4o-mini`)
+  - `localAgent.openRouter.presetName = system-promt` (neu ban co preset tren OpenRouter)
 - `localAgent.provider.apiMode`: mac dinh `lm_rest_chat` de dung duoc thinking + mcp integrations native cua LM Studio
+- `localAgent.systemPrompt`: custom system prompt ap dung cho Chat + Plan + Agent
 - `localAgent.maxTurnsPerStep`: gioi han so turn/step
 - `localAgent.maxAskUser`: gioi han so lan duoc phep hoi user
 - `localAgent.minInvestigationsBeforeExecute`: so lan toi thieu phai list/search/read truoc khi write/run/complete
-- `localAgent.systemPromptExtra`: prompt system bo sung
+- `localAgent.systemPromptExtra`: alias cu (legacy), nen dung `localAgent.systemPrompt`
 
 ## 3) Cach dung
 
@@ -72,7 +80,7 @@ Agent prompt da co cac rang buoc:
 Ban can bam `Run Agent` (khong phai `Plan Only`).
 `Plan Only` chi tao ke hoach, khong sua code, khong chay command.
 
-Ban co the tang do \"cung\" bang `localAgent.systemPromptExtra`, vi du:
+Ban co the tang do \"cung\" bang `localAgent.systemPrompt`, vi du:
 
 ```
 Never ask user about coding details that can be inferred from repository.

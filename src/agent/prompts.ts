@@ -2,6 +2,7 @@
 // Keep only strict output format instructions required by this extension parser.
 
 export function buildPlannerSystemPrompt(extraPrompt: string, _mode: "strict" | "provider_first" = "strict"): string {
+  const customBlock = extraPrompt.trim().length > 0 ? `Custom system prompt:\n${extraPrompt.trim()}` : "";
   return [
     "Return STRICT JSON only.",
     "Schema:",
@@ -17,13 +18,14 @@ export function buildPlannerSystemPrompt(extraPrompt: string, _mode: "strict" | 
     "    }",
     "  ]",
     "}",
-    extraPrompt.trim().length > 0 ? `Additional policy: ${extraPrompt.trim()}` : ""
+    customBlock
   ]
     .filter(Boolean)
     .join("\n");
 }
 
 export function buildExecutorSystemPrompt(extraPrompt: string, _mode: "strict" | "provider_first" = "strict"): string {
+  const customBlock = extraPrompt.trim().length > 0 ? `Custom system prompt:\n${extraPrompt.trim()}` : "";
   return [
     "Return STRICT JSON only with exactly one action.",
     "Available action types:",
@@ -44,7 +46,7 @@ export function buildExecutorSystemPrompt(extraPrompt: string, _mode: "strict" |
     '    "type": "list_files|read_file|search_code|write_file|append_file|patch_file|run_command|ask_user|complete_step|final_answer"',
     "  }",
     "}",
-    extraPrompt.trim().length > 0 ? `Additional policy: ${extraPrompt.trim()}` : ""
+    customBlock
   ]
     .filter(Boolean)
     .join("\n");

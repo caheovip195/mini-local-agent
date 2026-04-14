@@ -4,6 +4,7 @@ import { LmStudioClient, type ChatMessage, type ThinkingEffort } from "./lmStudi
 import { extractJsonObject } from "./utils";
 
 const DEFAULT_LM_BASE_URL = "http://127.0.0.1:1234/v1";
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const MAX_CACHE_ITEMS = 120;
 const MAX_INLINE_CANDIDATES = 6;
 const COMMENT_WINDOW_LINES = 16;
@@ -49,12 +50,24 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
 
     const providerPresetRaw = cfg.get<string>("provider.preset", "lmstudio").trim().toLowerCase();
-    const configuredPreset = providerPresetRaw === "custom" ? "custom" : "lmstudio";
+    const configuredPreset =
+      providerPresetRaw === "custom" ? "custom" : providerPresetRaw === "openrouter" ? "openrouter" : "lmstudio";
     const providerPreset = configuredPreset;
     const legacyBaseUrl = cfg.get<string>("lmStudio.baseUrl", DEFAULT_LM_BASE_URL);
+    const openRouterBaseUrl = cfg.get<string>("openRouter.baseUrl", DEFAULT_OPENROUTER_BASE_URL).trim();
+    const openRouterApiKey = this.normalizeApiKey(cfg.get<string>("openRouter.apiKey", ""));
+    const openRouterModel = cfg.get<string>("openRouter.model", "").trim();
+    const openRouterPresetName = cfg.get<string>("openRouter.presetName", "").trim();
+    const openRouterSiteUrl = cfg.get<string>("openRouter.siteUrl", "").trim();
+    const openRouterAppName = cfg.get<string>("openRouter.appName", "Local Agent Coder").trim();
     const providerBaseUrl = cfg.get<string>("provider.baseUrl", "").trim();
     const baseDefault = legacyBaseUrl;
-    const baseInput = providerPreset === "custom" ? providerBaseUrl || legacyBaseUrl : legacyBaseUrl;
+    const baseInput =
+      providerPreset === "custom"
+        ? providerBaseUrl || legacyBaseUrl
+        : providerPreset === "openrouter"
+          ? openRouterBaseUrl || providerBaseUrl || DEFAULT_OPENROUTER_BASE_URL
+          : legacyBaseUrl;
     const lmBaseUrl = this.normalizeBaseUrl(baseInput, baseDefault);
 
     const legacyApiKey = this.normalizeApiKey(cfg.get<string>("lmStudio.apiKey", ""));
@@ -64,9 +77,15 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
         ? providerApiKey.length > 0
           ? providerApiKey
           : legacyApiKey
-        : providerApiKey.length > 0
-          ? providerApiKey
-          : legacyApiKey;
+        : providerPreset === "openrouter"
+          ? openRouterApiKey.length > 0
+            ? openRouterApiKey
+            : providerApiKey.length > 0
+              ? providerApiKey
+              : legacyApiKey
+          : providerApiKey.length > 0
+            ? providerApiKey
+            : legacyApiKey;
 
     const configuredModel = cfg.get<string>("lmStudio.model", "qwen2.5-coder-7b-instruct");
     const providerModel = cfg.get<string>("provider.model", "").trim();
@@ -74,9 +93,14 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     const providerApiMode = providerApiModeRaw === "responses" ? "responses" : "chat_completions";
     const providerPresetName = cfg.get<string>("provider.presetName", "").trim();
     const legacyLmPreset = cfg.get<string>("lmStudio.preset", "").trim();
-    const presetName = providerPresetName || legacyLmPreset;
+    const presetName = providerPreset === "lmstudio" ? providerPresetName || legacyLmPreset : providerPresetName;
     const inlineModel = cfg.get<string>("inline.model", "").trim();
-    const defaultModel = providerPreset === "custom" ? providerModel || configuredModel : configuredModel;
+    const defaultModel =
+      providerPreset === "custom"
+        ? providerModel || configuredModel
+        : providerPreset === "openrouter"
+          ? providerModel || openRouterModel || configuredModel
+          : configuredModel;
     const model = inlineModel.length > 0 ? inlineModel : defaultModel;
     const providerChatPathDefault = providerApiMode === "responses" ? "/responses" : "/chat/completions";
     const providerChatPathRaw = cfg.get<string>("provider.chatPath", providerChatPathDefault);
@@ -87,10 +111,32 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
         : providerChatPathNormalized;
     const extraHeaders = this.parseHeaderJson(cfg.get<string>("provider.extraHeaders", "{}"));
     const extraBody = this.parseBodyJson(cfg.get<string>("provider.extraBody", "{}"));
-    if (presetName.length > 0 && !Object.prototype.hasOwnProperty.call(extraBody, "preset")) {
-      extraBody.preset = presetName;
+    const effectivePresetName = providerPreset === "openrouter" ? openRouterPresetName || providerPresetName : presetName;
+    if (effectivePresetName.length > 0 && !Object.prototype.hasOwnProperty.call(extraBody, "preset")) {
+      extraBody.preset = effectivePresetName;
     }
-    const headers: Record<string, string> = { ...extraHeaders };
+    if (
+      providerPreset === "openrouter" &&
+      Object.prototype.hasOwnProperty.call(extraBody, "preset") &&
+      typeof extraBody.preset !== "string"
+    ) {
+      delete extraBody.preset;
+    }
+    if (
+      providerPreset === "openrouter" &&
+      typeof extraBody.preset === "string" &&
+      extraBody.preset.trim().length === 0
+    ) {
+      delete extraBody.preset;
+    }
+    const headers: Record<string, string> =
+      providerPreset === "openrouter"
+        ? {
+            ...(openRouterSiteUrl.length > 0 ? { "HTTP-Referer": openRouterSiteUrl } : {}),
+            ...(openRouterAppName.length > 0 ? { "X-Title": openRouterAppName } : {}),
+            ...extraHeaders
+          }
+        : { ...extraHeaders };
     const maxTokens = Math.min(Math.max(cfg.get<number>("inline.maxTokens", 160), 32), 400);
     const maxContextChars = Math.min(Math.max(cfg.get<number>("inline.maxContextChars", 6000), 1200), 20000);
     const maxSuggestionChars = Math.min(Math.max(cfg.get<number>("inline.maxSuggestionChars", 420), 80), 4000);
@@ -127,7 +173,7 @@ export class LocalInlineCompletionProvider implements vscode.InlineCompletionIte
     }
 
     const client = new LmStudioClient({
-      providerName: providerPreset === "custom" ? "Custom API" : "LM Studio",
+      providerName: providerPreset === "custom" ? "Custom API" : providerPreset === "openrouter" ? "OpenRouter" : "LM Studio",
       baseUrl: lmBaseUrl,
       apiKey,
       model,

@@ -15,7 +15,8 @@ interface ModelBootstrapState {
 
 export function buildWebviewHtml(
   thinking: ThinkingSettings,
-  bootstrap?: ModelBootstrapState
+  bootstrap?: ModelBootstrapState,
+  initialSystemPrompt = ""
 ): string {
     const nonce = createNonce();
     const modelItems = Array.isArray(bootstrap?.items)
@@ -36,6 +37,7 @@ export function buildWebviewHtml(
       })
       .join("");
     const initialBaseUrl = escapeHtmlAttr((bootstrap?.baseUrl || "").trim());
+    const initialSystemPromptText = escapeHtmlText(String(initialSystemPrompt || "").trim());
     const initialModelInfo = escapeHtmlText(String(bootstrap?.error || bootstrap?.info || "").trim());
     const initialModelInfoClass = bootstrap?.error ? "hint error" : "hint";
 
@@ -230,6 +232,11 @@ export function buildWebviewHtml(
       resize: vertical;
       padding: 11px 12px;
       line-height: 1.5;
+    }
+
+    #systemPromptInput {
+      min-height: 86px;
+      max-height: 220px;
     }
 
     textarea::placeholder,
@@ -776,7 +783,7 @@ export function buildWebviewHtml(
               <div class="control-label">API Base URL</div>
               <div class="row">
                 <div class="grow">
-                  <input id="baseUrlInput" type="text" value="${initialBaseUrl}" placeholder="LM Studio URL (e.g. http://127.0.0.1:1234/v1)" />
+                  <input id="baseUrlInput" type="text" value="${initialBaseUrl}" placeholder="Provider URL (e.g. http://127.0.0.1:1234/v1 or https://openrouter.ai/api/v1)" />
                 </div>
                 <button id="reloadModels" type="button" onclick="(function(){try{var api=acquireVsCodeApi();if(!api||typeof api.postMessage!=='function'){return;}var modelEl=document.getElementById('modelSelect');var baseUrlEl=document.getElementById('baseUrlInput');api.postMessage({type:'load_models',preferredModel:(modelEl&&modelEl.value)||'',baseUrl:(baseUrlEl&&baseUrlEl.value)||''});}catch(_){}})()">Reload Models</button>
               </div>
@@ -805,6 +812,16 @@ export function buildWebviewHtml(
                 </div>
               </div>
               <div class="hint">Enable when task is complex and needs deeper reasoning.</div>
+            </div>
+
+            <div>
+              <div class="control-label">System Prompt (Custom)</div>
+              <textarea id="systemPromptInput" placeholder="Custom system prompt for Chat + Plan + Agent...">${initialSystemPromptText}</textarea>
+              <div class="row">
+                <button id="saveSystemPromptBtn" type="button">Save Prompt</button>
+                <button id="clearSystemPromptBtn" type="button">Clear Prompt</button>
+              </div>
+              <div class="hint">Saved per workspace. Applied before each run.</div>
             </div>
           </div>
 
@@ -929,6 +946,9 @@ export function buildWebviewHtml(
     const modelInfoEl = document.getElementById("modelInfo");
     const thinkingToggleEl = document.getElementById("thinkingToggle");
     const thinkingEffortEl = document.getElementById("thinkingEffort");
+    const systemPromptInputEl = document.getElementById("systemPromptInput");
+    const saveSystemPromptBtn = document.getElementById("saveSystemPromptBtn");
+    const clearSystemPromptBtn = document.getElementById("clearSystemPromptBtn");
     const planEl = document.getElementById("plan");
     const progressBarEl = document.getElementById("progressBar");
     const stepStatsEl = document.getElementById("stepStats");
@@ -1344,7 +1364,16 @@ export function buildWebviewHtml(
           " thinking=" +
           (thinkingEnabled ? thinkingEffort : "off")
       );
-      post({ type: "run", mode: "chat", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
+      post({
+        type: "run",
+        mode: "chat",
+        prompt,
+        model,
+        baseUrl,
+        thinkingEnabled,
+        thinkingEffort,
+        systemPrompt: String((systemPromptInputEl && systemPromptInputEl.value) || "")
+      });
 
       if (chatComposerEl) {
         chatComposerEl.value = "";
@@ -1810,7 +1839,16 @@ export function buildWebviewHtml(
             (thinkingEnabled ? thinkingEffort : "off")
         );
         clearForRun();
-        post({ type: "run", mode: "plan", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
+        post({
+          type: "run",
+          mode: "plan",
+          prompt,
+          model,
+          baseUrl,
+          thinkingEnabled,
+          thinkingEffort,
+          systemPrompt: String((systemPromptInputEl && systemPromptInputEl.value) || "")
+        });
       });
     }
 
@@ -1836,7 +1874,16 @@ export function buildWebviewHtml(
             (thinkingEnabled ? thinkingEffort : "off")
         );
         clearForRun();
-        post({ type: "run", mode: "agent", prompt, model, baseUrl, thinkingEnabled, thinkingEffort });
+        post({
+          type: "run",
+          mode: "agent",
+          prompt,
+          model,
+          baseUrl,
+          thinkingEnabled,
+          thinkingEffort,
+          systemPrompt: String((systemPromptInputEl && systemPromptInputEl.value) || "")
+        });
       });
     }
 
@@ -1904,6 +1951,32 @@ export function buildWebviewHtml(
           return;
         }
         post({ type: "clear_session" });
+      });
+    }
+
+    if (saveSystemPromptBtn) {
+      saveSystemPromptBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const text = String((systemPromptInputEl && systemPromptInputEl.value) || "");
+        post({ type: "save_system_prompt", text });
+        appendLog(
+          text.trim().length > 0
+            ? "System prompt saved."
+            : "System prompt cleared."
+        );
+      });
+    }
+
+    if (clearSystemPromptBtn) {
+      clearSystemPromptBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (systemPromptInputEl && typeof systemPromptInputEl.value === "string") {
+          systemPromptInputEl.value = "";
+        }
+        post({ type: "save_system_prompt", text: "" });
+        appendLog("System prompt cleared.");
       });
     }
 
@@ -1997,6 +2070,15 @@ export function buildWebviewHtml(
           }
           if (chatComposerEl) {
             chatComposerEl.readOnly = disabled;
+          }
+          if (saveSystemPromptBtn) {
+            saveSystemPromptBtn.disabled = disabled;
+          }
+          if (clearSystemPromptBtn) {
+            clearSystemPromptBtn.disabled = disabled;
+          }
+          if (systemPromptInputEl) {
+            systemPromptInputEl.readOnly = disabled;
           }
           syncThinkingControls();
           break;

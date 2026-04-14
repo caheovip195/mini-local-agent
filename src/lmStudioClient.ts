@@ -90,6 +90,7 @@ export class LmStudioClient {
   private readonly headers: Record<string, string>;
   private readonly extraBody: Record<string, unknown>;
   private readonly onDebug?: (message: string) => void;
+  private presetDisabled = false;
   private model: string;
 
   constructor(options: ClientOptions) {
@@ -167,27 +168,30 @@ export class LmStudioClient {
       ...(options ?? {}),
       thinkingApiStyle: this.normalizeThinkingApiStyle(options?.thinkingApiStyle)
     };
+    let omitPreset = this.presetDisabled;
 
     const maxAttempts = 6;
     this.debug(
       `chat:start endpoint=${endpointMode} model=${requestedModel} stream=${streamRequested ? "true" : "false"} opts=${this.describeChatOptions(effectiveOptions, endpointMode)}`
     );
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      this.debug(`chat:attempt ${attempt}/${maxAttempts} opts=${this.describeChatOptions(effectiveOptions, endpointMode)}`);
+      this.debug(
+        `chat:attempt ${attempt}/${maxAttempts} opts=${this.describeChatOptions(effectiveOptions, endpointMode)} preset=${omitPreset ? "disabled" : "enabled"}`
+      );
       try {
         if (streamRequested) {
           try {
-            return await this.chatStream(messages, requestedModel, signal, effectiveOptions);
+            return await this.chatStream(messages, requestedModel, signal, effectiveOptions, omitPreset);
           } catch (streamError) {
             const streamEmitted = (streamError as { streamEmitted?: boolean }).streamEmitted === true;
             if (!streamEmitted) {
-              return await this.chatJson(messages, requestedModel, signal, effectiveOptions);
+              return await this.chatJson(messages, requestedModel, signal, effectiveOptions, omitPreset);
             }
             throw streamError;
           }
         }
 
-        return await this.chatJson(messages, requestedModel, signal, effectiveOptions);
+        return await this.chatJson(messages, requestedModel, signal, effectiveOptions, omitPreset);
       } catch (error) {
         if (signal?.aborted) {
           throw new Error(`${this.providerName} request cancelled.`);
@@ -195,6 +199,15 @@ export class LmStudioClient {
 
         lastError = error instanceof Error ? error : new Error(String(error));
         this.debug(`chat:error attempt=${attempt} message=${lastError.message}`);
+        if (!omitPreset && this.isPresetNotFoundError(lastError.message) && this.hasConfiguredPreset()) {
+          omitPreset = true;
+          this.presetDisabled = true;
+          this.debug("chat:fallback disable preset because provider cannot find configured preset name");
+          if (attempt < maxAttempts) {
+            continue;
+          }
+        }
+
         if (Array.isArray(effectiveOptions.integrations) && effectiveOptions.integrations.length > 0) {
           const deniedIntegration = this.extractDeniedIntegrationId(lastError.message);
           const integrationPermissionIssue =
@@ -399,6 +412,23 @@ export class LmStudioClient {
     );
   }
 
+  private isPresetNotFoundError(message: string): boolean {
+    const text = message.toLowerCase();
+    return (
+      text.includes("cannot find preset") ||
+      (text.includes("preset") && text.includes("not found")) ||
+      (text.includes("preset") && text.includes("unknown"))
+    );
+  }
+
+  private hasConfiguredPreset(): boolean {
+    return (
+      Object.prototype.hasOwnProperty.call(this.extraBody, "preset") &&
+      typeof this.extraBody.preset === "string" &&
+      this.extraBody.preset.trim().length > 0
+    );
+  }
+
   private normalizeThinkingApiStyle(value: unknown): ThinkingApiStyle {
     const raw = String(value ?? "").trim().toLowerCase();
     if (raw === "reasoning_effort" || raw === "reasoning_object") {
@@ -478,10 +508,15 @@ export class LmStudioClient {
     messages: ChatMessage[],
     requestedModel: string,
     options: ChatOptions | undefined,
-    stream: boolean
+    stream: boolean,
+    omitPreset: boolean
   ): Record<string, unknown> {
     const endpointMode = this.getEndpointMode();
     const extraBodyPatch = this.buildExtraBodyPatch();
+    if (omitPreset && Object.prototype.hasOwnProperty.call(extraBodyPatch, "preset")) {
+      delete extraBodyPatch.preset;
+      this.debug("chat:removed extraBody key 'preset' due fallback/presetDisabled");
+    }
     if (endpointMode === "lm_rest_chat") {
       if (Object.prototype.hasOwnProperty.call(extraBodyPatch, "preset")) {
         delete extraBodyPatch.preset;
@@ -575,12 +610,13 @@ export class LmStudioClient {
     messages: ChatMessage[],
     requestedModel: string,
     signal: AbortSignal | undefined,
-    options?: ChatOptions
+    options?: ChatOptions,
+    omitPreset = false
   ): Promise<ChatResult> {
     const response = await fetch(this.joinUrl(this.chatPath), {
       method: "POST",
       headers: this.buildHeaders(true),
-      body: JSON.stringify(this.buildChatRequestBody(messages, requestedModel, options, false)),
+      body: JSON.stringify(this.buildChatRequestBody(messages, requestedModel, options, false, omitPreset)),
       signal
     });
 
@@ -614,7 +650,8 @@ export class LmStudioClient {
     messages: ChatMessage[],
     requestedModel: string,
     signal: AbortSignal | undefined,
-    options?: ChatOptions
+    options?: ChatOptions,
+    omitPreset = false
   ): Promise<ChatResult> {
     let emittedAny = false;
 
@@ -622,7 +659,7 @@ export class LmStudioClient {
       const response = await fetch(this.joinUrl(this.chatPath), {
         method: "POST",
         headers: this.buildHeaders(true),
-        body: JSON.stringify(this.buildChatRequestBody(messages, requestedModel, options, true)),
+        body: JSON.stringify(this.buildChatRequestBody(messages, requestedModel, options, true, omitPreset)),
         signal
       });
 
@@ -1431,6 +1468,6 @@ export class LmStudioClient {
     if (!lower.includes("invalid_api_key") && !lower.includes("malformed") && !lower.includes("api token")) {
       return base;
     }
-    return `${base}\nHint: Set a valid token in localAgent.lmStudio.apiKey (or localAgent.provider.apiKey). Use raw token only, not 'Bearer ...' and not placeholder 'lm-studio'.`;
+    return `${base}\nHint: Set a valid token in localAgent.openRouter.apiKey, localAgent.lmStudio.apiKey, or localAgent.provider.apiKey. Use raw token only, not 'Bearer ...' and not placeholder 'lm-studio'.`;
   }
 }
